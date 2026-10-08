@@ -36,7 +36,7 @@ def test_forward_fp32_matches_reference_across_first_tile_boundary():
 
     probabilities = JointAttnSoftmaxCudaOp().forward_fp32(scores_cpu.cuda()).cpu()
 
-    torch.testing.assert_close(probabilities, expected, rtol=1e-6, atol=1e-7)
+    assert tensor_bytes_equal(probabilities, expected)
 
 
 @pytest.mark.parametrize("key_length", [1, 255, 256, 257, 513, 1024])

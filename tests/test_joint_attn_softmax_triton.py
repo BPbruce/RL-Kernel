@@ -6,7 +6,22 @@
 import pytest
 import torch
 
+from rl_engine.kernels.gtest.tolerance import load_contract, resolve_tolerance
 from rl_engine.testing.bitwise import tensor_bytes_equal
+
+_CONTRACT = load_contract()
+
+
+def _accuracy_tolerance(dtype: torch.dtype, judgment: str) -> tuple[float, float]:
+    """Return rtol/atol from the shared reduction contract."""
+    spec = resolve_tolerance(
+        _CONTRACT,
+        judgment=judgment,
+        op_class="reduction",
+        dtype=dtype,
+    )
+    return spec.rtol, spec.atol
+
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
@@ -331,11 +346,16 @@ def test_leading_fully_masked_tiles_still_produce_finite_forward_and_backward(
     assert torch.isfinite(actual_scores.grad).all()
     assert torch.count_nonzero(actual[:masked_keys]) == 0
     assert torch.count_nonzero(actual_scores.grad[:masked_keys]) == 0
-    tolerance = {torch.float32: (5e-4, 1e-6), torch.bfloat16: (2e-2, 2e-4)}
-    rtol, atol = tolerance[dtype]
-    torch.testing.assert_close(actual.cpu(), expected.detach(), rtol=rtol, atol=atol)
+    forward_rtol, forward_atol = _accuracy_tolerance(dtype, "forward_accuracy")
+    gradient_rtol, gradient_atol = _accuracy_tolerance(dtype, "gradient_accuracy")
     torch.testing.assert_close(
-        actual_scores.grad.cpu(), reference_scores.grad.to(dtype), rtol=rtol, atol=atol
+        actual.cpu(), expected.detach(), rtol=forward_rtol, atol=forward_atol
+    )
+    torch.testing.assert_close(
+        actual_scores.grad.cpu(),
+        reference_scores.grad.to(dtype),
+        rtol=gradient_rtol,
+        atol=gradient_atol,
     )
     assert tensor_bytes_equal(actual.cpu(), cpu_probabilities.detach())
     assert tensor_bytes_equal(actual_scores.grad.cpu(), cpu_scores.grad)

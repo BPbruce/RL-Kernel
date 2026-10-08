@@ -6,8 +6,22 @@
 import pytest
 import torch
 
+from rl_engine.kernels.gtest.tolerance import load_contract, resolve_tolerance
 from rl_engine.kernels.ops.pytorch.attention.joint_attn_softmax import NativeJointAttnSoftmaxOp
 from rl_engine.testing.bitwise import tensor_bytes_equal
+
+_CONTRACT = load_contract()
+
+
+def _accuracy_tolerance(dtype: torch.dtype, judgment: str) -> tuple[float, float]:
+    """Return rtol/atol from the shared reduction contract."""
+    spec = resolve_tolerance(
+        _CONTRACT,
+        judgment=judgment,
+        op_class="reduction",
+        dtype=dtype,
+    )
+    return spec.rtol, spec.atol
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -39,7 +53,8 @@ def test_forward_fp32_is_stable_for_large_scores():
     probabilities = NativeJointAttnSoftmaxOp().forward_fp32(scores)
 
     assert torch.isfinite(probabilities).all()
-    torch.testing.assert_close(probabilities, torch.softmax(scores, dim=-1), rtol=1e-6, atol=1e-7)
+    rtol, atol = _accuracy_tolerance(torch.float32, "forward_accuracy")
+    torch.testing.assert_close(probabilities, torch.softmax(scores, dim=-1), rtol=rtol, atol=atol)
 
 
 def test_forward_fp32_matches_fixed_tile_order_across_boundary():
@@ -115,12 +130,13 @@ def test_forward_fp32_matches_softmax_definition(key_length):
 
     assert probabilities.shape == scores.shape
     assert probabilities.dtype == torch.float32
-    torch.testing.assert_close(probabilities, expected, rtol=1e-6, atol=1e-7)
+    rtol, atol = _accuracy_tolerance(torch.float32, "forward_accuracy")
+    torch.testing.assert_close(probabilities, expected, rtol=rtol, atol=atol)
     torch.testing.assert_close(
         probabilities.sum(dim=-1),
         torch.ones_like(probabilities[..., 0]),
-        rtol=1e-6,
-        atol=1e-7,
+        rtol=rtol,
+        atol=atol,
     )
 
 
@@ -197,12 +213,19 @@ def test_negative_infinity_mask_can_cover_leading_tiles(
     if key_length > masked_key_count + 1:
         assert probabilities[-1] == 0
         assert scores.grad[-1] == 0
-    rtol, atol = (5e-3, 5e-4) if dtype == torch.bfloat16 else (1e-6, 1e-7)
+    forward_rtol, forward_atol = _accuracy_tolerance(dtype, "forward_accuracy")
+    gradient_rtol, gradient_atol = _accuracy_tolerance(dtype, "gradient_accuracy")
     torch.testing.assert_close(
-        probabilities.float(), expected_probabilities.float(), rtol=rtol, atol=atol
+        probabilities.float(),
+        expected_probabilities.float(),
+        rtol=forward_rtol,
+        atol=forward_atol,
     )
     torch.testing.assert_close(
-        scores.grad.float(), expected_grad_scores.float(), rtol=rtol, atol=atol
+        scores.grad.float(),
+        expected_grad_scores.float(),
+        rtol=gradient_rtol,
+        atol=gradient_atol,
     )
 
 
@@ -217,7 +240,8 @@ def test_backward_matches_softmax_derivative():
     expected_scores = scores.clone().requires_grad_(True)
     torch.softmax(expected_scores, dim=-1).backward(upstream)
 
-    torch.testing.assert_close(actual_scores.grad, expected_scores.grad, rtol=2e-6, atol=1e-7)
+    rtol, atol = _accuracy_tolerance(torch.float32, "gradient_accuracy")
+    torch.testing.assert_close(actual_scores.grad, expected_scores.grad, rtol=rtol, atol=atol)
 
 
 def test_backward_is_batch_invariant():
