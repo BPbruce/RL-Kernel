@@ -236,6 +236,27 @@ def test_backward_is_batch_invariant():
     assert tensor_bytes_equal(batched_scores.grad[1], alone_scores.grad)
 
 
+def test_masked_prompt_padding_is_batch_invariant():
+    target = torch.linspace(-5.0, 5.0, 769, dtype=torch.float32)
+    # The first 512 keys are text positions: 73 valid tokens, then padding.
+    target[73:512] = float("-inf")
+    upstream = torch.linspace(1.0, -1.0, 769, dtype=torch.float32)
+    op = NativeJointAttnSoftmaxOp()
+
+    alone_scores = target.clone().requires_grad_(True)
+    alone_probabilities = op.forward_fp32(alone_scores)
+    alone_probabilities.backward(upstream)
+
+    batched_scores = torch.stack([target.flip(0), target, torch.zeros_like(target)])
+    batched_scores.requires_grad_(True)
+    batched_upstream = torch.stack([torch.zeros_like(upstream), upstream, upstream.flip(0)])
+    batched_probabilities = op.forward_fp32(batched_scores)
+    batched_probabilities.backward(batched_upstream)
+
+    assert tensor_bytes_equal(batched_probabilities[1], alone_probabilities)
+    assert tensor_bytes_equal(batched_scores.grad[1], alone_scores.grad)
+
+
 @pytest.mark.parametrize(
     "dtype,output_fp32",
     [(torch.float32, True), (torch.bfloat16, False), (torch.bfloat16, True)],

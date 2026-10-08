@@ -93,7 +93,9 @@ test inputs; those assertions use no `rtol` or `atol`.
 Invariance tests compare a row alone and in batches with different companions
 and positions, changing the number of row programs. They also compare output
 and gradient bytes for the first 256 keys at `K=256` versus `K=257` with an
-added `-inf` key, exercising an extra fully masked tile. Tile width, CUDA block
+added `-inf` key, exercising an extra fully masked tile. A separate case uses
+512 text positions with 73 valid tokens and masked prompt padding, then checks
+the same row alone and at a different batch position. Tile width, CUDA block
 width, and Triton warp count are fixed production settings, not independently
 variable launch configurations validated by these tests.
 
@@ -124,7 +126,15 @@ python -m pytest -p no:cacheprovider \
   tests/test_joint_attn_softmax_triton.py \
   tests/test_joint_attn_softmax_registry.py \
   tests/test_joint_attn_softmax_full_shapes.py \
-  tests/test_build_platform_collectives.py -q
+  tests/test_build_platform_collectives.py \
+  tests/test_operator_inputs.py -q
+
+python scripts/check_operator.py --op joint_attn_softmax --candidate pytorch \
+  --device cpu --dtype fp32 --batch 2 --seq 257 --check-grad
+python scripts/check_operator.py --op joint_attn_softmax --candidate cuda \
+  --device cuda --dtype bf16 --batch 2 --seq 257 --check-grad
+python scripts/check_operator.py --op joint_attn_softmax --candidate triton \
+  --device cuda --dtype bf16 --batch 2 --seq 257 --check-grad
 
 python benchmarks/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype bf16
 python benchmarks/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype bf16 --backward
@@ -133,9 +143,12 @@ python benchmarks/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype
 
 The CUDA extension must be built before GPU validation. The validation
 environment was WSL Ubuntu, Python 3.12.13, PyTorch 2.13.0+cu130, Triton
-3.7.1, CUDA runtime 13.0, and NVIDIA GeForce RTX 5060 (compute capability
-12.0). On 2026-09-29, the six-file suite above passed **109 tests, with 0
-skipped, 0 failures, and 0 errors**. Separate BF16/FP32 ×
+3.7.1, NVIDIA driver 591.86, CUDA toolkit/runtime 13.0, GCC 13.3.0, and an
+NVIDIA GeForce RTX 5060 (compute capability 12.0). On 2026-10-08, the
+seven-file suite above passed **140 tests, with 0 skipped, 0 failures, and 0
+errors**. The three `check_operator.py` runs also passed with gradient checks.
+Registry dispatch selected the CUDA extension with fingerprint
+`joint-attn-softmax-v1-tile256-exp7` and no fallback. Separate BF16/FP32 ×
 forward/backward benchmark runs passed strict CUDA↔Triton byte checks at all
 three key lengths. This is evidence for that environment, not a claim about
 untested hardware.
