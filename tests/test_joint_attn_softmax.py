@@ -90,6 +90,13 @@ def test_rejects_empty_key_sequence():
         NativeJointAttnSoftmaxOp().forward_fp32(scores)
 
 
+def test_rejects_fully_masked_row():
+    scores = torch.tensor([[0.0, 1.0], [float("-inf"), float("-inf")]])
+
+    with pytest.raises(ValueError, match="at least one finite key"):
+        NativeJointAttnSoftmaxOp().forward_fp32(scores)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float64])
 def test_rejects_dtype_outside_bf16_fp32(dtype):
     scores = torch.zeros(2, 4, dtype=dtype)
@@ -227,6 +234,44 @@ def test_backward_is_batch_invariant():
     op.forward_fp32(batched_scores).backward(batched_upstream)
 
     assert tensor_bytes_equal(batched_scores.grad[1], alone_scores.grad)
+
+
+@pytest.mark.parametrize(
+    "dtype,output_fp32",
+    [(torch.float32, True), (torch.bfloat16, False), (torch.bfloat16, True)],
+)
+def test_vectorized_rows_match_individual_rows_byte_for_byte(dtype, output_fp32):
+    key_length = 513
+    base = torch.linspace(-5.0, 5.0, key_length, dtype=torch.float32)
+    masked = base.clone()
+    masked[:256] = float("-inf")
+    scores = torch.stack([base, base.flip(0), masked]).to(dtype)
+    upstream = torch.stack(
+        [
+            torch.linspace(1.0, -1.0, key_length),
+            torch.linspace(-0.5, 0.5, key_length),
+            torch.linspace(0.25, -0.75, key_length),
+        ]
+    )
+    if not output_fp32:
+        upstream = upstream.to(dtype)
+
+    op = NativeJointAttnSoftmaxOp()
+    batched_scores = scores.clone().requires_grad_(True)
+    batched_probabilities = op.forward_fp32(batched_scores) if output_fp32 else op(batched_scores)
+    batched_probabilities.backward(upstream)
+
+    individual_probabilities = []
+    individual_gradients = []
+    for row, row_upstream in zip(scores, upstream, strict=True):
+        individual_scores = row.clone().requires_grad_(True)
+        probabilities = op.forward_fp32(individual_scores) if output_fp32 else op(individual_scores)
+        probabilities.backward(row_upstream)
+        individual_probabilities.append(probabilities.detach())
+        individual_gradients.append(individual_scores.grad)
+
+    assert tensor_bytes_equal(batched_probabilities.detach(), torch.stack(individual_probabilities))
+    assert tensor_bytes_equal(batched_scores.grad, torch.stack(individual_gradients))
 
 
 def test_bf16_backward_returns_bf16_gradient_from_fp32_reference():

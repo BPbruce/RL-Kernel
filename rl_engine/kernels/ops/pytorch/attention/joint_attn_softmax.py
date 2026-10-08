@@ -64,6 +64,21 @@ class _NativeJointAttnSoftmaxFunction(torch.autograd.Function):
         return grad_scores.to(ctx.input_dtype), None
 
 
+def _validate_scores(scores: torch.Tensor) -> None:
+    """Check structural inputs before entering the fixed arithmetic."""
+    if scores.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"scores must use BF16 or FP32, got {scores.dtype}")
+    if scores.dim() < 1:
+        raise ValueError("scores must be at least 1-D with shape [..., K]")
+    if scores.size(-1) == 0:
+        raise ValueError("scores key dimension must be non-empty")
+
+
+# ---------------------------------------------------------------------------
+# Forward
+# ---------------------------------------------------------------------------
+
+
 def _fixed_online_softmax(scores: torch.Tensor) -> torch.Tensor:
     """Apply the same per-row arithmetic independently of the batch shape."""
     scores_fp32 = scores.float()
@@ -71,8 +86,83 @@ def _fixed_online_softmax(scores: torch.Tensor) -> torch.Tensor:
         return scores_fp32.clone()
     key_length = scores_fp32.size(-1)
     rows = scores_fp32.reshape(-1, key_length)
-    probabilities = torch.stack([_fixed_online_softmax_row(row) for row in rows])
+    probabilities = _fixed_online_softmax_rows(rows)
     return probabilities.reshape(scores.shape)
+
+
+def _fixed_online_softmax_rows(rows: torch.Tensor) -> torch.Tensor:
+    """Merge fixed tile states for every row in parallel, then normalize."""
+    row_count, key_length = rows.shape
+    online_max = rows.new_full((row_count,), float("-inf"))
+    online_sum = rows.new_zeros(row_count)
+    has_online_state = torch.zeros(row_count, device=rows.device, dtype=torch.bool)
+
+    # First pass: fixed tree within each tile, then left-to-right online merge.
+    for tile_start in range(0, key_length, _TILE_K):
+        tile = rows[:, tile_start : tile_start + _TILE_K]
+        max_values = _pad_tile(tile, float("-inf"))
+        tile_max = _tree_max_256(max_values)
+
+        # Avoid -inf - -inf while giving an all-masked tile zero mass.
+        tile_has_finite_key = tile_max > float("-inf")
+        safe_tile_max = torch.where(tile_has_finite_key, tile_max, torch.zeros_like(tile_max))
+
+        exp_values = _portable_exp_nonpositive(tile - safe_tile_max.unsqueeze(-1))
+        sum_values = _pad_tile(exp_values, 0.0)
+        tile_sum = _tree_sum_256(sum_values)
+
+        online_max, online_sum, has_online_state = _merge_online_softmax_state(
+            online_max,
+            online_sum,
+            has_online_state,
+            tile_max,
+            tile_sum,
+        )
+
+    all_rows_have_finite_key = has_online_state.all()
+    error_message = "each score row must contain at least one finite key"
+    if all_rows_have_finite_key.is_cuda:
+        torch._assert_async(all_rows_have_finite_key, error_message)
+    elif not bool(all_rows_have_finite_key):
+        raise ValueError(error_message)
+
+    # Second pass: use the final row state, without changing the merge order.
+    probabilities = torch.empty_like(rows)
+    for tile_start in range(0, key_length, _TILE_K):
+        tile = rows[:, tile_start : tile_start + _TILE_K]
+        probabilities[:, tile_start : tile_start + _TILE_K] = _portable_exp_nonpositive(
+            tile - online_max.unsqueeze(-1)
+        ) / online_sum.unsqueeze(-1)
+    return probabilities
+
+
+def _merge_online_softmax_state(
+    online_max: torch.Tensor,
+    online_sum: torch.Tensor,
+    has_online_state: torch.Tensor,
+    tile_max: torch.Tensor,
+    tile_sum: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Initialize, merge, or skip each row's fixed online state."""
+    tile_has_finite_key = tile_max > float("-inf")
+    first_valid_rows = ~has_online_state & tile_has_finite_key
+    merge_rows = has_online_state & tile_has_finite_key
+
+    new_max = torch.maximum(online_max, tile_max)
+    old_delta = torch.where(merge_rows, online_max - new_max, torch.zeros_like(online_max))
+    tile_delta = torch.where(merge_rows, tile_max - new_max, torch.zeros_like(tile_max))
+    merged_sum = online_sum * _portable_exp_nonpositive(old_delta)
+    merged_sum = merged_sum + tile_sum * _portable_exp_nonpositive(tile_delta)
+
+    next_max = torch.where(tile_has_finite_key, new_max, online_max)
+    next_sum = torch.where(first_valid_rows, tile_sum, online_sum)
+    next_sum = torch.where(merge_rows, merged_sum, next_sum)
+    return next_max, next_sum, has_online_state | tile_has_finite_key
+
+
+# ---------------------------------------------------------------------------
+# Backward
+# ---------------------------------------------------------------------------
 
 
 def _fixed_softmax_backward(
@@ -85,119 +175,70 @@ def _fixed_softmax_backward(
     key_length = probabilities.size(-1)
     probability_rows = probabilities.reshape(-1, key_length)
     gradient_rows = grad_probabilities.float().reshape(-1, key_length)
-
-    grad_scores = torch.stack(
-        [
-            _fixed_softmax_backward_row(probability_row, gradient_row)
-            for probability_row, gradient_row in zip(probability_rows, gradient_rows, strict=True)
-        ],
-        dim=0,
-    )
+    grad_scores = _fixed_softmax_backward_rows(probability_rows, gradient_rows)
     return grad_scores.reshape(probabilities.shape)
 
 
-def _validate_scores(scores: torch.Tensor) -> None:
-    """Check structural inputs; the finite-row condition is a caller precondition."""
-    if scores.dtype not in (torch.bfloat16, torch.float32):
-        raise TypeError(f"scores must use BF16 or FP32, got {scores.dtype}")
-    if scores.dim() < 1:
-        raise ValueError("scores must be at least 1-D with shape [..., K]")
-    if scores.size(-1) == 0:
-        raise ValueError("scores key dimension must be non-empty")
-
-
-def _fixed_online_softmax_row(row: torch.Tensor) -> torch.Tensor:
-    """Merge tile (max, sum) states, then normalize one row in FP32."""
-    online_max: torch.Tensor | None = None
-    online_sum: torch.Tensor | None = None
-
-    # First pass: fixed tree within each tile, then left-to-right online merge.
-    for tile_start in range(0, row.numel(), _TILE_K):
-        tile = row[tile_start : tile_start + _TILE_K]
-        padding = _TILE_K - tile.numel()
-
-        max_values = torch.cat(
-            [tile, torch.full((padding,), float("-inf"), device=row.device, dtype=row.dtype)]
-        )
-        tile_max = _tree_max_256(max_values)
-
-        # An all-masked tile has zero mass. Merging two such tiles would evaluate
-        # -inf - -inf, so only finite tiles participate in the online state.
-        if torch.isneginf(tile_max):
-            continue
-
-        exp_values = torch.where(
-            torch.isneginf(tile),
-            torch.zeros_like(tile),
-            _portable_exp_nonpositive(tile - tile_max),
-        )
-        sum_values = torch.cat(
-            [exp_values, torch.zeros((padding,), device=row.device, dtype=row.dtype)]
-        )
-        tile_sum = _tree_sum_256(sum_values)
-
-        if online_max is None:
-            online_max = tile_max
-            online_sum = tile_sum
-        else:
-            assert online_sum is not None
-            new_max = torch.maximum(online_max, tile_max)
-            old_scale = _portable_exp_nonpositive(online_max - new_max)
-            scaled_old_sum = online_sum * old_scale
-            tile_scale = _portable_exp_nonpositive(tile_max - new_max)
-            scaled_tile_sum = tile_sum * tile_scale
-            online_sum = scaled_old_sum + scaled_tile_sum
-            online_max = new_max
-
-    assert online_max is not None and online_sum is not None
-    # Second pass: use the final row state, without changing the merge order.
-    return _portable_exp_nonpositive(row - online_max) / online_sum
-
-
-def _fixed_softmax_backward_row(
+def _fixed_softmax_backward_rows(
     probabilities: torch.Tensor, grad_probabilities: torch.Tensor
 ) -> torch.Tensor:
-    """Compute P * (dP - delta) with a fixed reduction for delta = sum(P * dP)."""
+    """Apply the fixed softmax derivative to every row in parallel."""
     row_delta: torch.Tensor | None = None
+    key_length = probabilities.size(-1)
 
-    for tile_start in range(0, probabilities.numel(), _TILE_K):
+    for tile_start in range(0, key_length, _TILE_K):
         tile_products = (
-            probabilities[tile_start : tile_start + _TILE_K]
-            * grad_probabilities[tile_start : tile_start + _TILE_K]
+            probabilities[:, tile_start : tile_start + _TILE_K]
+            * grad_probabilities[:, tile_start : tile_start + _TILE_K]
         )
-
-        padding = _TILE_K - tile_products.numel()
-        tree_values = torch.cat(
-            [
-                tile_products,
-                torch.zeros((padding,), device=probabilities.device, dtype=probabilities.dtype),
-            ]
-        )
+        tree_values = _pad_tile(tile_products, 0.0)
         tile_delta = _tree_sum_256(tree_values)
         row_delta = tile_delta if row_delta is None else row_delta + tile_delta
 
     assert row_delta is not None
-    return probabilities * (grad_probabilities - row_delta)
+    grad_scores = torch.empty_like(probabilities)
+    # Write one tile at a time to limit peak temporary memory.
+    for tile_start in range(0, key_length, _TILE_K):
+        probability_tile = probabilities[:, tile_start : tile_start + _TILE_K]
+        gradient_tile = grad_probabilities[:, tile_start : tile_start + _TILE_K]
+        grad_scores[:, tile_start : tile_start + _TILE_K] = probability_tile * (
+            gradient_tile - row_delta.unsqueeze(-1)
+        )
+    return grad_scores
+
+
+# ---------------------------------------------------------------------------
+# Fixed-order helpers
+# ---------------------------------------------------------------------------
+
+
+def _pad_tile(values: torch.Tensor, fill_value: float) -> torch.Tensor:
+    """Pad only a partial final tile along its last dimension."""
+    padding = _TILE_K - values.size(-1)
+    if padding == 0:
+        return values
+    padding_values = values.new_full((*values.shape[:-1], padding), fill_value)
+    return torch.cat([values, padding_values], dim=-1)
 
 
 def _tree_max_256(values: torch.Tensor) -> torch.Tensor:
-    """Reduce one padded tile with pairings 128, 64, ..., 1."""
+    """Reduce padded tiles along the last dimension with fixed pairings."""
     width = _TILE_K
     while width > 1:
         half = width // 2
-        values = torch.maximum(values[:half], values[half:width])
+        values = torch.maximum(values[..., :half], values[..., half:width])
         width = half
-    return values[0]
+    return values[..., 0]
 
 
 def _tree_sum_256(values: torch.Tensor) -> torch.Tensor:
-    """Reduce one padded tile with pairings 128, 64, ..., 1."""
+    """Reduce padded tiles along the last dimension with fixed pairings."""
     width = _TILE_K
     while width > 1:
         half = width // 2
-        values = values[:half] + values[half:width]
+        values = values[..., :half] + values[..., half:width]
         width = half
-    return values[0]
+    return values[..., 0]
 
 
 def _portable_exp_nonpositive(values: torch.Tensor) -> torch.Tensor:
