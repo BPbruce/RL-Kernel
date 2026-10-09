@@ -118,6 +118,24 @@ def test_fully_masked_row_returns_zero_probabilities_and_gradients(dtype, output
     )
 
 
+@pytest.mark.parametrize("invalid_score", [float("nan"), float("inf")], ids=["nan", "posinf"])
+def test_unsupported_nonfinite_scores_propagate_nan(invalid_score):
+    from rl_engine.kernels.ops.cuda.attention.joint_attn_softmax import JointAttnSoftmaxCudaOp
+
+    scores = torch.tensor(
+        [[invalid_score, float("-inf")]],
+        device="cuda",
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    probabilities = JointAttnSoftmaxCudaOp().forward_fp32(scores)
+    probabilities.backward(torch.ones_like(probabilities))
+
+    assert torch.isnan(probabilities).any()
+    assert torch.isnan(scores.grad).any()
+
+
 @pytest.mark.parametrize("leading_masked_tiles", [1, 2])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("output_fp32", [False, True])

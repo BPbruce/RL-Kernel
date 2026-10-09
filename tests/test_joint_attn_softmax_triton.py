@@ -130,6 +130,24 @@ def test_fully_masked_row_returns_zero_probabilities_and_gradients(dtype, output
     )
 
 
+@pytest.mark.parametrize("invalid_score", [float("nan"), float("inf")], ids=["nan", "posinf"])
+def test_unsupported_nonfinite_scores_propagate_nan(invalid_score):
+    from rl_engine.kernels.ops.triton.attention.joint_attn_softmax import TritonJointAttnSoftmaxOp
+
+    scores = torch.tensor(
+        [[invalid_score, float("-inf")]],
+        device="cuda",
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    probabilities = TritonJointAttnSoftmaxOp().forward_fp32(scores)
+    probabilities.backward(torch.ones_like(probabilities))
+
+    assert torch.isnan(probabilities).any()
+    assert torch.isnan(scores.grad).any()
+
+
 def test_registry_falls_back_to_triton_when_cuda_symbol_is_unavailable(monkeypatch):
     from rl_engine.kernels.ops.base import _C
     from rl_engine.kernels.ops.triton.attention.joint_attn_softmax import TritonJointAttnSoftmaxOp
@@ -329,7 +347,11 @@ def test_masked_benchmark_reports_prompt_layout():
         )
     )
 
+    assert report["schema_version"] == "rlkernel.joint_attn_softmax_benchmark.v3"
     assert report["configuration"]["valid_text_keys"] == 73
+    assert report["configuration"]["warmup"] == 0
+    assert report["configuration"]["iterations"] == 1
+    assert report["environment"]["git_commit"] != "unavailable"
     assert all(record["masked_prompt_keys"] == 439 for record in report["results"])
     assert all(record["byte_equal_to_cuda"] for record in report["results"])
 

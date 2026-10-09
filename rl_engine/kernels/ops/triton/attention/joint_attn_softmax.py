@@ -72,8 +72,14 @@ def _div_rn(left, right):
 
 
 @triton.jit
+def _is_nan(values):
+    bits = tl.cast(values, tl.int32, bitcast=True)
+    return (bits & 0x7FFFFFFF) > 0x7F800000
+
+
+@triton.jit
 def _portable_exp_nonpositive(values):
-    is_nan = values != values
+    is_nan = _is_nan(values)
     safe_values = tl.where(is_nan, 0.0, tl.maximum(values, -104.0))
     scaled = _add_rn(_mul_rn(safe_values, 1.4426950216293335), 0.5)
     exponent = tl.floor(scaled).to(tl.int32)
@@ -230,31 +236,33 @@ def _joint_attn_softmax_forward_kernel(
             other=float("-inf"),
         ).to(tl.float32)
         tile_max = _tree_max_256(scores)
-        if tile_max != float("-inf"):
-            contributes = valid & (scores != float("-inf"))
-            exp_values = tl.where(
-                contributes,
-                _portable_exp_nonpositive(_sub_rn(scores, tile_max)),
-                0.0,
-            )
-            tile_sum = _tree_sum_256(exp_values)
+        contributes = valid & (scores != float("-inf"))
+        exp_values = tl.where(
+            contributes,
+            _portable_exp_nonpositive(_sub_rn(scores, tile_max)),
+            0.0,
+        )
+        tile_sum = _tree_sum_256(exp_values)
+        # Keep the finite max tree unchanged while exposing unsupported NaN/+inf input.
+        tile_state_max = tl.where(_is_nan(tile_sum), float("nan"), tile_max)
 
+        if tile_state_max != float("-inf"):
             if online_max == float("-inf"):
-                online_max = tile_max
+                online_max = tile_state_max
                 online_sum = tile_sum
             else:
-                new_max = tl.maximum(online_max, tile_max)
+                new_max = tl.maximum(online_max, tile_state_max)
                 old_scale = _portable_exp_nonpositive(_sub_rn(online_max, new_max))
-                tile_scale = _portable_exp_nonpositive(_sub_rn(tile_max, new_max))
+                tile_scale = _portable_exp_nonpositive(_sub_rn(tile_state_max, new_max))
                 online_sum = _add_rn(
                     _mul_rn(online_sum, old_scale),
                     _mul_rn(tile_sum, tile_scale),
                 )
                 online_max = new_max
 
-    row_has_finite_key = online_max != float("-inf")
-    safe_online_max = tl.where(row_has_finite_key, online_max, 0.0)
-    safe_online_sum = tl.where(row_has_finite_key, online_sum, 1.0)
+    row_has_state = online_max != float("-inf")
+    safe_online_max = tl.where(row_has_state, online_max, 0.0)
+    safe_online_sum = tl.where(row_has_state, online_sum, 1.0)
 
     for tile_start in range(0, key_length, TILE_K):
         columns = tile_start + lane
@@ -273,7 +281,7 @@ def _joint_attn_softmax_forward_kernel(
         ).to(tl.float32)
         exp_values = _portable_exp_nonpositive(_sub_rn(scores, safe_online_max))
         probabilities = tl.where(
-            row_has_finite_key,
+            row_has_state,
             _div_rn(exp_values, safe_online_sum),
             0.0,
         )

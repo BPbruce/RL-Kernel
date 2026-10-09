@@ -116,6 +116,17 @@ def test_fully_masked_row_returns_zero_probabilities_and_gradients():
     assert tensor_bytes_equal(scores.grad[1], torch.zeros(2))
 
 
+@pytest.mark.parametrize("invalid_score", [float("nan"), float("inf")], ids=["nan", "posinf"])
+def test_unsupported_nonfinite_scores_propagate_nan(invalid_score):
+    scores = torch.tensor([[invalid_score, float("-inf")]], dtype=torch.float32, requires_grad=True)
+
+    probabilities = NativeJointAttnSoftmaxOp().forward_fp32(scores)
+    probabilities.backward(torch.ones_like(probabilities))
+
+    assert torch.isnan(probabilities).any()
+    assert torch.isnan(scores.grad).any()
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float64])
 def test_rejects_dtype_outside_bf16_fp32(dtype):
     scores = torch.zeros(2, 4, dtype=dtype)
@@ -382,10 +393,9 @@ def test_prompt_padding_preserves_negative_zero_backward_bytes():
 
 
 def test_explicit_key_padding_mask_broadcasts_across_heads_and_queries():
-    scores = torch.linspace(-5.0, 5.0, 60, dtype=torch.float32).reshape(2, 2, 3, 5)
-    key_padding_mask = torch.tensor(
-        [[True, False, True, False, True], [False, True, True, True, False]]
-    )
+    scores = torch.linspace(-5.0, 5.0, 2 * 2 * 3 * 513, dtype=torch.float32).reshape(2, 2, 3, 513)
+    positions = torch.arange(513)
+    key_padding_mask = torch.stack((positions % 3 != 1, positions % 4 != 0))
     expanded_mask = key_padding_mask[:, None, None, :].expand_as(scores)
     upstream = torch.linspace(1.0, -1.0, scores.numel()).reshape_as(scores)
     op = NativeJointAttnSoftmaxOp()
@@ -397,12 +407,18 @@ def test_explicit_key_padding_mask_broadcasts_across_heads_and_queries():
     )
     explicit_probabilities.backward(upstream)
 
-    materialized_scores = scores.masked_fill(~expanded_mask, float("-inf")).requires_grad_(True)
-    materialized_probabilities = op.forward_fp32(materialized_scores)
-    materialized_probabilities.backward(upstream)
+    for batch_index, logical_mask in enumerate(key_padding_mask):
+        compact_scores = scores[batch_index, ..., logical_mask].clone().requires_grad_(True)
+        compact_upstream = upstream[batch_index, ..., logical_mask]
+        compact_probabilities = op.forward_fp32(compact_scores)
+        compact_probabilities.backward(compact_upstream)
 
-    assert tensor_bytes_equal(explicit_probabilities, materialized_probabilities)
-    assert tensor_bytes_equal(explicit_scores.grad, materialized_scores.grad)
+        assert tensor_bytes_equal(
+            explicit_probabilities[batch_index, ..., logical_mask], compact_probabilities
+        )
+        assert tensor_bytes_equal(
+            explicit_scores.grad[batch_index, ..., logical_mask], compact_scores.grad
+        )
     assert torch.count_nonzero(explicit_probabilities.masked_select(~expanded_mask)) == 0
     assert torch.count_nonzero(explicit_scores.grad.masked_select(~expanded_mask)) == 0
 

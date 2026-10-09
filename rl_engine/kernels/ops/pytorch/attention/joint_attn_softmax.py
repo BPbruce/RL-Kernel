@@ -9,7 +9,8 @@ may use ``-inf`` to mask keys; fully masked rows return zero probabilities.
 
 Rows use 256-key tiles with fixed reduction and left-to-right merge order.
 CUDA and Triton follow the same arithmetic contract for bytewise comparison.
-NaNs and ``+inf`` are outside that contract.
+Unsupported NaNs and ``+inf`` propagate NaN results and remain outside that
+contract.
 """
 
 from __future__ import annotations
@@ -140,8 +141,8 @@ def _fixed_online_softmax_rows(rows: torch.Tensor) -> torch.Tensor:
         tile_max = _tree_max_256(max_values)
 
         # Avoid -inf - -inf while giving an all-masked tile zero mass.
-        tile_has_finite_key = tile_max > float("-inf")
-        safe_tile_max = torch.where(tile_has_finite_key, tile_max, torch.zeros_like(tile_max))
+        tile_has_unmasked_score = tile_max != float("-inf")
+        safe_tile_max = torch.where(tile_has_unmasked_score, tile_max, torch.zeros_like(tile_max))
 
         exp_values = _portable_exp_nonpositive(tile - safe_tile_max.unsqueeze(-1))
         sum_values = _pad_tile(exp_values, 0.0)
@@ -180,9 +181,9 @@ def _merge_online_softmax_state(
     tile_sum: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Initialize, merge, or skip each row's fixed online state."""
-    tile_has_finite_key = tile_max > float("-inf")
-    first_valid_rows = ~has_online_state & tile_has_finite_key
-    merge_rows = has_online_state & tile_has_finite_key
+    tile_has_unmasked_score = tile_max != float("-inf")
+    first_valid_rows = ~has_online_state & tile_has_unmasked_score
+    merge_rows = has_online_state & tile_has_unmasked_score
 
     new_max = torch.maximum(online_max, tile_max)
     old_delta = torch.where(merge_rows, online_max - new_max, torch.zeros_like(online_max))
@@ -190,10 +191,10 @@ def _merge_online_softmax_state(
     merged_sum = online_sum * _portable_exp_nonpositive(old_delta)
     merged_sum = merged_sum + tile_sum * _portable_exp_nonpositive(tile_delta)
 
-    next_max = torch.where(tile_has_finite_key, new_max, online_max)
+    next_max = torch.where(tile_has_unmasked_score, new_max, online_max)
     next_sum = torch.where(first_valid_rows, tile_sum, online_sum)
     next_sum = torch.where(merge_rows, merged_sum, next_sum)
-    return next_max, next_sum, has_online_state | tile_has_finite_key
+    return next_max, next_sum, has_online_state | tile_has_unmasked_score
 
 
 # ---------------------------------------------------------------------------

@@ -138,17 +138,20 @@ __global__ void joint_attn_softmax_forward_kernel(
       __syncthreads();
     }
     const float tile_sum = reduction[0];
+    // A NaN sum marks unsupported NaN/+inf input without changing the finite
+    // max tree.
+    const float tile_state_max = isnan(tile_sum) ? NAN : tile_max;
 
-    if (tid == 0 && tile_max != -INFINITY) {
+    if (tid == 0 && tile_state_max != -INFINITY) {
       if (online_max == -INFINITY) {
-        online_max = tile_max;
+        online_max = tile_state_max;
         online_sum = tile_sum;
       } else {
-        const float new_max = fmaxf(online_max, tile_max);
+        const float new_max = fmaxf(online_max, tile_state_max);
         const float old_scale =
             portable_exp_nonpositive(__fsub_rn(online_max, new_max));
         const float tile_scale =
-            portable_exp_nonpositive(__fsub_rn(tile_max, new_max));
+            portable_exp_nonpositive(__fsub_rn(tile_state_max, new_max));
         const float scaled_old = __fmul_rn(online_sum, old_scale);
         const float scaled_tile = __fmul_rn(tile_sum, tile_scale);
         online_max = new_max;

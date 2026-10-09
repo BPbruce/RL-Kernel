@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import subprocess
 import sys
 from collections.abc import Callable
 from functools import partial
@@ -35,7 +36,8 @@ from typing import Any
 import torch
 
 # Allow direct execution from a source checkout without an editable install.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT))
 
 from rl_engine.kernels.ops.cuda.attention.joint_attn_softmax import (  # noqa: E402
     JointAttnSoftmaxCudaOp,
@@ -51,6 +53,16 @@ DEFAULT_CASES = {
     "1664x928": 6544,
 }
 _TEXT_KEY_SLOTS = 512
+
+
+def _git_commit() -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else "unavailable"
 
 
 def _parse_cases(raw: str | None) -> dict[str, int]:
@@ -137,6 +149,7 @@ def _environment() -> dict[str, Any]:
         "cuda_runtime": torch.version.cuda,
         "device": torch.cuda.get_device_name(),
         "compute_capability": ".".join(str(value) for value in torch.cuda.get_device_capability()),
+        "git_commit": _git_commit(),
     }
 
 
@@ -233,13 +246,15 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         record["cuda_speed_ratio"] = baseline / record["latency_ms"]
 
     return {
-        "schema_version": "rlkernel.joint_attn_softmax_benchmark.v2",
+        "schema_version": "rlkernel.joint_attn_softmax_benchmark.v3",
         "environment": _environment(),
         "configuration": {
             "rows": args.rows,
             "dtype": args.dtype,
             "direction": "backward" if args.backward else "forward",
             "valid_text_keys": args.valid_text_keys,
+            "warmup": args.warmup,
+            "iterations": args.iterations,
         },
         "results": records,
     }
