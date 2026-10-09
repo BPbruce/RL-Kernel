@@ -5,11 +5,22 @@
 
 from __future__ import annotations
 
+from math import prod
+
 import torch
 import triton
 import triton.language as tl
 
+from rl_engine.kernels.ops.joint_attn_softmax_layout import (
+    LogicalKeyMapping,
+    validate_key_padding_mask,
+)
+
 _TILE_K = 256
+
+# ---------------------------------------------------------------------------
+# Fixed arithmetic
+# ---------------------------------------------------------------------------
 
 
 @triton.jit
@@ -117,14 +128,60 @@ def _tree_sum_256(values):
     return tl.sum(total, axis=0)
 
 
+# ---------------------------------------------------------------------------
+# Key-layout kernel
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _joint_attn_softmax_key_mapping_kernel(
+    key_padding_mask_ptr,
+    logical_to_physical_ptr,
+    valid_key_counts_ptr,
+    key_length,
+    TILE_K: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    lane = tl.arange(0, TILE_K)
+    batch_offset = batch.to(tl.int64) * key_length
+    next_logical_key = tl.zeros((), tl.int32)
+
+    for tile_start in range(0, key_length, TILE_K):
+        physical_keys = tile_start + lane
+        in_bounds = physical_keys < key_length
+        valid_keys = tl.load(
+            key_padding_mask_ptr + batch_offset + physical_keys,
+            mask=in_bounds,
+            other=0,
+        ).to(tl.int32)
+        logical_keys = next_logical_key + tl.cumsum(valid_keys, axis=0) - 1
+        tl.store(
+            logical_to_physical_ptr + batch_offset + logical_keys,
+            physical_keys,
+            mask=in_bounds & (valid_keys != 0),
+        )
+        next_logical_key += tl.sum(valid_keys, axis=0)
+
+    tl.store(valid_key_counts_ptr + batch, next_logical_key)
+
+
+# ---------------------------------------------------------------------------
+# Forward kernel
+# ---------------------------------------------------------------------------
+
+
 @triton.jit
 def _joint_attn_softmax_forward_kernel(
     scores_ptr,
     probabilities_ptr,
     saved_probabilities_ptr,
+    logical_to_physical_ptr,
+    valid_key_counts_ptr,
     row_count,
     key_length,
+    rows_per_batch,
     SAVE_STATE: tl.constexpr,
+    HAS_KEY_LAYOUT: tl.constexpr,
     TILE_K: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -133,14 +190,42 @@ def _joint_attn_softmax_forward_kernel(
 
     lane = tl.arange(0, TILE_K)
     row_offset = row.to(tl.int64) * key_length
+    if HAS_KEY_LAYOUT:
+        batch = row // rows_per_batch
+        key_map_offset = batch.to(tl.int64) * key_length
+        valid_key_count = tl.load(valid_key_counts_ptr + batch)
+        for tile_start in range(0, key_length, TILE_K):
+            physical_columns = tile_start + lane
+            physical_valid = physical_columns < key_length
+            tl.store(
+                probabilities_ptr + row_offset + physical_columns,
+                0.0,
+                mask=physical_valid,
+            )
+            if SAVE_STATE:
+                tl.store(
+                    saved_probabilities_ptr + row_offset + physical_columns,
+                    0.0,
+                    mask=physical_valid,
+                )
+    else:
+        key_map_offset = 0
+        valid_key_count = key_length
     online_max = tl.full((), float("-inf"), tl.float32)
     online_sum = tl.zeros((), tl.float32)
 
     for tile_start in range(0, key_length, TILE_K):
         columns = tile_start + lane
-        valid = columns < key_length
+        valid = columns < valid_key_count
+        physical_columns = columns
+        if HAS_KEY_LAYOUT:
+            physical_columns = tl.load(
+                logical_to_physical_ptr + key_map_offset + columns,
+                mask=valid,
+                other=0,
+            )
         scores = tl.load(
-            scores_ptr + row_offset + columns,
+            scores_ptr + row_offset + physical_columns,
             mask=valid,
             other=float("-inf"),
         ).to(tl.float32)
@@ -167,19 +252,47 @@ def _joint_attn_softmax_forward_kernel(
                 )
                 online_max = new_max
 
+    row_has_finite_key = online_max != float("-inf")
+    safe_online_max = tl.where(row_has_finite_key, online_max, 0.0)
+    safe_online_sum = tl.where(row_has_finite_key, online_sum, 1.0)
+
     for tile_start in range(0, key_length, TILE_K):
         columns = tile_start + lane
-        valid = columns < key_length
-        scores = tl.load(scores_ptr + row_offset + columns, mask=valid, other=0.0).to(tl.float32)
-        exp_values = _portable_exp_nonpositive(_sub_rn(scores, online_max))
-        probabilities = _div_rn(exp_values, online_sum)
-        tl.store(probabilities_ptr + row_offset + columns, probabilities, mask=valid)
+        valid = columns < valid_key_count
+        physical_columns = columns
+        if HAS_KEY_LAYOUT:
+            physical_columns = tl.load(
+                logical_to_physical_ptr + key_map_offset + columns,
+                mask=valid,
+                other=0,
+            )
+        scores = tl.load(
+            scores_ptr + row_offset + physical_columns,
+            mask=valid,
+            other=0.0,
+        ).to(tl.float32)
+        exp_values = _portable_exp_nonpositive(_sub_rn(scores, safe_online_max))
+        probabilities = tl.where(
+            row_has_finite_key,
+            _div_rn(exp_values, safe_online_sum),
+            0.0,
+        )
+        tl.store(
+            probabilities_ptr + row_offset + physical_columns,
+            probabilities,
+            mask=valid,
+        )
         if SAVE_STATE:
             tl.store(
-                saved_probabilities_ptr + row_offset + columns,
+                saved_probabilities_ptr + row_offset + physical_columns,
                 probabilities,
                 mask=valid,
             )
+
+
+# ---------------------------------------------------------------------------
+# Backward kernel
+# ---------------------------------------------------------------------------
 
 
 @triton.jit
@@ -187,8 +300,12 @@ def _joint_attn_softmax_backward_kernel(
     probabilities_ptr,
     grad_probabilities_ptr,
     grad_scores_ptr,
+    logical_to_physical_ptr,
+    valid_key_counts_ptr,
     row_count,
     key_length,
+    rows_per_batch,
+    HAS_KEY_LAYOUT: tl.constexpr,
     TILE_K: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -197,40 +314,133 @@ def _joint_attn_softmax_backward_kernel(
 
     lane = tl.arange(0, TILE_K)
     row_offset = row.to(tl.int64) * key_length
+    if HAS_KEY_LAYOUT:
+        batch = row // rows_per_batch
+        key_map_offset = batch.to(tl.int64) * key_length
+        valid_key_count = tl.load(valid_key_counts_ptr + batch)
+        for tile_start in range(0, key_length, TILE_K):
+            physical_columns = tile_start + lane
+            physical_valid = physical_columns < key_length
+            tl.store(
+                grad_scores_ptr + row_offset + physical_columns,
+                0.0,
+                mask=physical_valid,
+            )
+    else:
+        key_map_offset = 0
+        valid_key_count = key_length
 
     columns = lane
-    valid = columns < key_length
-    probabilities = tl.load(probabilities_ptr + row_offset + columns, mask=valid, other=0.0).to(
-        tl.float32
-    )
+    valid = columns < valid_key_count
+    physical_columns = columns
+    if HAS_KEY_LAYOUT:
+        physical_columns = tl.load(
+            logical_to_physical_ptr + key_map_offset + columns,
+            mask=valid,
+            other=0,
+        )
+    probabilities = tl.load(
+        probabilities_ptr + row_offset + physical_columns,
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
     grad_probabilities = tl.load(
-        grad_probabilities_ptr + row_offset + columns, mask=valid, other=0.0
+        grad_probabilities_ptr + row_offset + physical_columns,
+        mask=valid,
+        other=0.0,
     ).to(tl.float32)
     row_delta = _tree_sum_256(_mul_rn(probabilities, grad_probabilities))
 
     for tile_start in range(TILE_K, key_length, TILE_K):
         columns = tile_start + lane
-        valid = columns < key_length
-        probabilities = tl.load(probabilities_ptr + row_offset + columns, mask=valid, other=0.0).to(
-            tl.float32
-        )
+        valid = columns < valid_key_count
+        physical_columns = columns
+        if HAS_KEY_LAYOUT:
+            physical_columns = tl.load(
+                logical_to_physical_ptr + key_map_offset + columns,
+                mask=valid,
+                other=0,
+            )
+        probabilities = tl.load(
+            probabilities_ptr + row_offset + physical_columns,
+            mask=valid,
+            other=0.0,
+        ).to(tl.float32)
         grad_probabilities = tl.load(
-            grad_probabilities_ptr + row_offset + columns, mask=valid, other=0.0
+            grad_probabilities_ptr + row_offset + physical_columns,
+            mask=valid,
+            other=0.0,
         ).to(tl.float32)
         tile_delta = _tree_sum_256(_mul_rn(probabilities, grad_probabilities))
         row_delta = _add_rn(row_delta, tile_delta)
 
     for tile_start in range(0, key_length, TILE_K):
         columns = tile_start + lane
-        valid = columns < key_length
-        probabilities = tl.load(probabilities_ptr + row_offset + columns, mask=valid, other=0.0).to(
-            tl.float32
-        )
+        valid = columns < valid_key_count
+        physical_columns = columns
+        if HAS_KEY_LAYOUT:
+            physical_columns = tl.load(
+                logical_to_physical_ptr + key_map_offset + columns,
+                mask=valid,
+                other=0,
+            )
+        probabilities = tl.load(
+            probabilities_ptr + row_offset + physical_columns,
+            mask=valid,
+            other=0.0,
+        ).to(tl.float32)
         grad_probabilities = tl.load(
-            grad_probabilities_ptr + row_offset + columns, mask=valid, other=0.0
+            grad_probabilities_ptr + row_offset + physical_columns,
+            mask=valid,
+            other=0.0,
         ).to(tl.float32)
         grad_scores = _mul_rn(probabilities, _sub_rn(grad_probabilities, row_delta))
-        tl.store(grad_scores_ptr + row_offset + columns, grad_scores, mask=valid)
+        # Padding can change the sign of an exact zero; always store +0.
+        grad_scores = tl.where(grad_scores == 0.0, 0.0, grad_scores)
+        tl.store(
+            grad_scores_ptr + row_offset + physical_columns,
+            grad_scores,
+            mask=valid,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Launch helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_key_mapping(
+    scores: torch.Tensor,
+    key_padding_mask: torch.Tensor,
+) -> LogicalKeyMapping:
+    """Build one compact logical-key map per batch item on the GPU."""
+    validate_key_padding_mask(scores, key_padding_mask)
+    batch_size, key_length = key_padding_mask.shape
+    logical_to_physical = torch.empty(
+        (batch_size, key_length),
+        device=scores.device,
+        dtype=torch.int32,
+    )
+    valid_key_counts = torch.empty(
+        batch_size,
+        device=scores.device,
+        dtype=torch.int32,
+    )
+    if batch_size > 0:
+        with torch.cuda.device(scores.device):
+            _joint_attn_softmax_key_mapping_kernel[(batch_size,)](
+                key_padding_mask.contiguous(),
+                logical_to_physical,
+                valid_key_counts,
+                key_length,
+                TILE_K=_TILE_K,
+                num_warps=8,
+            )
+    return LogicalKeyMapping(
+        logical_to_physical=logical_to_physical,
+        valid_key_counts=valid_key_counts,
+        rows_per_batch=prod(scores.shape[1:-1]),
+    )
 
 
 def _launch_forward(
@@ -238,6 +448,7 @@ def _launch_forward(
     *,
     output_dtype: torch.dtype,
     save_state: bool,
+    key_mapping: LogicalKeyMapping | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     key_length = scores.size(-1)
     contiguous_scores = scores.contiguous()
@@ -250,14 +461,21 @@ def _launch_forward(
     state_ptr = probabilities if saved_probabilities is None else saved_probabilities
     row_count = scores.numel() // key_length
     if row_count > 0:
+        logical_to_physical = scores if key_mapping is None else key_mapping.logical_to_physical
+        valid_key_counts = scores if key_mapping is None else key_mapping.valid_key_counts
+        rows_per_batch = 1 if key_mapping is None else key_mapping.rows_per_batch
         with torch.cuda.device(scores.device):
             _joint_attn_softmax_forward_kernel[(row_count,)](
                 contiguous_scores,
                 probabilities,
                 state_ptr,
+                logical_to_physical,
+                valid_key_counts,
                 row_count,
                 key_length,
+                rows_per_batch,
                 SAVE_STATE=saved_probabilities is not None,
+                HAS_KEY_LAYOUT=key_mapping is not None,
                 TILE_K=_TILE_K,
                 num_warps=8,
             )
@@ -265,23 +483,68 @@ def _launch_forward(
     return probabilities, backward_state
 
 
+# ---------------------------------------------------------------------------
+# Autograd bridge
+# ---------------------------------------------------------------------------
+
+
 class _TritonJointAttnSoftmaxFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, scores: torch.Tensor, output_fp32: bool) -> torch.Tensor:
+    def forward(
+        ctx,
+        scores: torch.Tensor,
+        output_fp32: bool,
+        logical_to_physical: torch.Tensor | None,
+        valid_key_counts: torch.Tensor | None,
+        rows_per_batch: int,
+    ) -> torch.Tensor:
         key_length = scores.size(-1)
         output_dtype = torch.float32 if output_fp32 else scores.dtype
+        key_mapping = (
+            None
+            if logical_to_physical is None or valid_key_counts is None
+            else LogicalKeyMapping(
+                logical_to_physical=logical_to_physical,
+                valid_key_counts=valid_key_counts,
+                rows_per_batch=rows_per_batch,
+            )
+        )
         probabilities, saved_probabilities_fp32 = _launch_forward(
-            scores, output_dtype=output_dtype, save_state=True
+            scores,
+            output_dtype=output_dtype,
+            save_state=True,
+            key_mapping=key_mapping,
         )
         assert saved_probabilities_fp32 is not None
-        ctx.save_for_backward(saved_probabilities_fp32)
+        if key_mapping is None:
+            ctx.save_for_backward(saved_probabilities_fp32)
+        else:
+            ctx.save_for_backward(
+                saved_probabilities_fp32,
+                key_mapping.logical_to_physical,
+                key_mapping.valid_key_counts,
+            )
+        ctx.has_key_layout = key_mapping is not None
         ctx.input_dtype = scores.dtype
         ctx.key_length = key_length
+        ctx.rows_per_batch = rows_per_batch
         return probabilities
 
     @staticmethod
-    def backward(ctx, grad_probabilities: torch.Tensor) -> tuple[torch.Tensor, None]:
-        (probabilities_fp32,) = ctx.saved_tensors
+    def backward(
+        ctx,
+        grad_probabilities: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None, None]:
+        probabilities_fp32 = ctx.saved_tensors[0]
+        key_mapping = (
+            LogicalKeyMapping(
+                logical_to_physical=ctx.saved_tensors[1],
+                valid_key_counts=ctx.saved_tensors[2],
+                rows_per_batch=ctx.rows_per_batch,
+            )
+            if ctx.has_key_layout
+            else None
+        )
         grad_scores = torch.empty(
             probabilities_fp32.shape,
             device=probabilities_fp32.device,
@@ -289,17 +552,33 @@ class _TritonJointAttnSoftmaxFunction(torch.autograd.Function):
         )
         row_count = probabilities_fp32.numel() // ctx.key_length
         if row_count > 0:
+            logical_to_physical = (
+                probabilities_fp32 if key_mapping is None else key_mapping.logical_to_physical
+            )
+            valid_key_counts = (
+                probabilities_fp32 if key_mapping is None else key_mapping.valid_key_counts
+            )
+            rows_per_batch = 1 if key_mapping is None else key_mapping.rows_per_batch
             with torch.cuda.device(probabilities_fp32.device):
                 _joint_attn_softmax_backward_kernel[(row_count,)](
                     probabilities_fp32,
                     grad_probabilities.contiguous(),
                     grad_scores,
+                    logical_to_physical,
+                    valid_key_counts,
                     row_count,
                     ctx.key_length,
+                    rows_per_batch,
+                    HAS_KEY_LAYOUT=key_mapping is not None,
                     TILE_K=_TILE_K,
                     num_warps=8,
                 )
-        return grad_scores, None
+        return grad_scores, None, None, None, None
+
+
+# ---------------------------------------------------------------------------
+# Public operator
+# ---------------------------------------------------------------------------
 
 
 class TritonJointAttnSoftmaxOp:
@@ -313,7 +592,7 @@ class TritonJointAttnSoftmaxOp:
         "split_k": False,
         "stream_k": False,
         "tf32": False,
-        "kernel_fingerprint": "joint-attn-softmax-v1-tile256-exp7",
+        "kernel_fingerprint": "joint-attn-softmax-v2-logical-mask-tile256-exp7",
         "fallback": False,
     }
 
@@ -323,27 +602,70 @@ class TritonJointAttnSoftmaxOp:
                 "the joint-attention Triton arithmetic contract currently uses CUDA PTX"
             )
 
-    def __call__(self, scores: torch.Tensor) -> torch.Tensor:
+    def __call__(
+        self,
+        scores: torch.Tensor,
+        *,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Alias for :meth:`forward`, matching the other backends."""
-        return self.forward(scores)
+        return self.forward(scores, key_padding_mask=key_padding_mask)
 
-    def forward(self, scores: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        scores: torch.Tensor,
+        *,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Compute in FP32 and cast once at the final Triton write."""
-        self._validate_scores(scores)
+        return self._forward_impl(scores, False, key_padding_mask)
 
-        if not torch.is_grad_enabled() or not scores.requires_grad:
-            probabilities, _ = _launch_forward(scores, output_dtype=scores.dtype, save_state=False)
-            return probabilities
-        return _TritonJointAttnSoftmaxFunction.apply(scores, False)
-
-    def forward_fp32(self, scores: torch.Tensor) -> torch.Tensor:
+    def forward_fp32(
+        self,
+        scores: torch.Tensor,
+        *,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Return FP32 probabilities over the final key dimension."""
-        self._validate_scores(scores)
+        return self._forward_impl(scores, True, key_padding_mask)
 
+    def _forward_impl(
+        self,
+        scores: torch.Tensor,
+        output_fp32: bool,
+        key_padding_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        self._validate_scores(scores)
+        key_mapping = (
+            None if key_padding_mask is None else _build_key_mapping(scores, key_padding_mask)
+        )
+        return self._forward_core(scores, output_fp32, key_mapping)
+
+    @staticmethod
+    def _forward_core(
+        scores: torch.Tensor,
+        output_fp32: bool,
+        key_mapping: LogicalKeyMapping | None,
+    ) -> torch.Tensor:
         if not torch.is_grad_enabled() or not scores.requires_grad:
-            probabilities, _ = _launch_forward(scores, output_dtype=torch.float32, save_state=False)
+            output_dtype = torch.float32 if output_fp32 else scores.dtype
+            probabilities, _ = _launch_forward(
+                scores,
+                output_dtype=output_dtype,
+                save_state=False,
+                key_mapping=key_mapping,
+            )
             return probabilities
-        return _TritonJointAttnSoftmaxFunction.apply(scores, True)
+        logical_to_physical = None if key_mapping is None else key_mapping.logical_to_physical
+        valid_key_counts = None if key_mapping is None else key_mapping.valid_key_counts
+        rows_per_batch = 1 if key_mapping is None else key_mapping.rows_per_batch
+        return _TritonJointAttnSoftmaxFunction.apply(
+            scores,
+            output_fp32,
+            logical_to_physical,
+            valid_key_counts,
+            rows_per_batch,
+        )
 
     @staticmethod
     def _validate_scores(scores: torch.Tensor) -> None:

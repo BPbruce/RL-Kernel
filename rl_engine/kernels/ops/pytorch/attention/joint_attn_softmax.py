@@ -5,16 +5,18 @@
 
 Softmax reduces the last dimension of BF16/FP32 ``scores[..., K]`` in FP32.
 ``forward`` returns the input dtype; ``forward_fp32`` returns FP32. Scores
-may use ``-inf`` to mask keys, but each row needs at least one finite key.
+may use ``-inf`` to mask keys; fully masked rows return zero probabilities.
 
 Rows use 256-key tiles with fixed reduction and left-to-right merge order.
 CUDA and Triton follow the same arithmetic contract for bytewise comparison.
-NaNs, ``+inf``, and fully masked rows are outside that contract.
+NaNs and ``+inf`` are outside that contract.
 """
 
 from __future__ import annotations
 
 import torch
+
+from rl_engine.kernels.ops.joint_attn_softmax_layout import KeyMaskLayout
 
 _TILE_K = 256
 
@@ -31,20 +33,54 @@ class NativeJointAttnSoftmaxOp:
         "split_k": False,
         "stream_k": False,
         "tf32": False,
-        "kernel_fingerprint": "joint-attn-softmax-v1-tile256-exp7",
+        "kernel_fingerprint": "joint-attn-softmax-v2-logical-mask-tile256-exp7",
         "fallback": False,
     }
 
-    def __call__(self, scores: torch.Tensor) -> torch.Tensor:
-        return self.forward(scores)
+    def __call__(
+        self,
+        scores: torch.Tensor,
+        *,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.forward(scores, key_padding_mask=key_padding_mask)
 
-    def forward(self, scores: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        scores: torch.Tensor,
+        *,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Return probabilities in the input dtype."""
-        return _NativeJointAttnSoftmaxFunction.apply(scores, False)
+        return _apply_fixed_softmax(scores, False, key_padding_mask)
 
-    def forward_fp32(self, scores: torch.Tensor) -> torch.Tensor:
+    def forward_fp32(
+        self,
+        scores: torch.Tensor,
+        *,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Return probabilities in FP32."""
-        return _NativeJointAttnSoftmaxFunction.apply(scores, True)
+        return _apply_fixed_softmax(scores, True, key_padding_mask)
+
+
+def _apply_fixed_softmax(
+    scores: torch.Tensor,
+    output_fp32: bool,
+    key_padding_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Apply optional layout handling around the fixed softmax core."""
+    if key_padding_mask is None:
+        return _NativeJointAttnSoftmaxFunction.apply(scores, output_fp32)
+
+    _validate_scores(scores)
+    mask_layout = KeyMaskLayout.from_mask(scores, key_padding_mask)
+    logical_scores = mask_layout.compact(scores, fill_value=float("-inf"))
+    logical_probabilities = _NativeJointAttnSoftmaxFunction.apply(
+        logical_scores,
+        output_fp32,
+    )
+    return mask_layout.restore(logical_probabilities, fill_value=0.0)
 
 
 class _NativeJointAttnSoftmaxFunction(torch.autograd.Function):
@@ -119,20 +155,20 @@ def _fixed_online_softmax_rows(rows: torch.Tensor) -> torch.Tensor:
             tile_sum,
         )
 
-    all_rows_have_finite_key = has_online_state.all()
-    error_message = "each score row must contain at least one finite key"
-    if all_rows_have_finite_key.is_cuda:
-        torch._assert_async(all_rows_have_finite_key, error_message)
-    elif not bool(all_rows_have_finite_key):
-        raise ValueError(error_message)
-
     # Second pass: use the final row state, without changing the merge order.
     probabilities = torch.empty_like(rows)
+    safe_online_max = torch.where(has_online_state, online_max, torch.zeros_like(online_max))
+    safe_online_sum = torch.where(has_online_state, online_sum, torch.ones_like(online_sum))
     for tile_start in range(0, key_length, _TILE_K):
         tile = rows[:, tile_start : tile_start + _TILE_K]
-        probabilities[:, tile_start : tile_start + _TILE_K] = _portable_exp_nonpositive(
-            tile - online_max.unsqueeze(-1)
-        ) / online_sum.unsqueeze(-1)
+        tile_probabilities = _portable_exp_nonpositive(
+            tile - safe_online_max.unsqueeze(-1)
+        ) / safe_online_sum.unsqueeze(-1)
+        probabilities[:, tile_start : tile_start + _TILE_K] = torch.where(
+            has_online_state.unsqueeze(-1),
+            tile_probabilities,
+            torch.zeros_like(tile_probabilities),
+        )
     return probabilities
 
 
@@ -166,7 +202,8 @@ def _merge_online_softmax_state(
 
 
 def _fixed_softmax_backward(
-    probabilities: torch.Tensor, grad_probabilities: torch.Tensor
+    probabilities: torch.Tensor,
+    grad_probabilities: torch.Tensor,
 ) -> torch.Tensor:
     """Apply the fixed backward independently to each flattened score row."""
     if probabilities.numel() == 0:
@@ -201,8 +238,12 @@ def _fixed_softmax_backward_rows(
     for tile_start in range(0, key_length, _TILE_K):
         probability_tile = probabilities[:, tile_start : tile_start + _TILE_K]
         gradient_tile = grad_probabilities[:, tile_start : tile_start + _TILE_K]
-        grad_scores[:, tile_start : tile_start + _TILE_K] = probability_tile * (
-            gradient_tile - row_delta.unsqueeze(-1)
+        tile_grad_scores = probability_tile * (gradient_tile - row_delta.unsqueeze(-1))
+        # Padding can change the sign of an exact zero; always store +0.
+        grad_scores[:, tile_start : tile_start + _TILE_K] = torch.where(
+            tile_grad_scores == 0.0,
+            torch.zeros_like(tile_grad_scores),
+            tile_grad_scores,
         )
     return grad_scores
 

@@ -60,7 +60,7 @@ def _args(**overrides):
         "kv_cache_attention",
     ],
 )
-def test_operator_inputs_support_all_issue_108_ops(op_name):
+def test_operator_inputs_support_registered_ops(op_name):
     args = _args()
     inputs = make_operator_inputs(op_name, args, torch.float32, torch.device("cpu"))
 

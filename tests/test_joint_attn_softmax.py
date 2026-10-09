@@ -105,11 +105,15 @@ def test_rejects_empty_key_sequence():
         NativeJointAttnSoftmaxOp().forward_fp32(scores)
 
 
-def test_rejects_fully_masked_row():
-    scores = torch.tensor([[0.0, 1.0], [float("-inf"), float("-inf")]])
+def test_fully_masked_row_returns_zero_probabilities_and_gradients():
+    scores = torch.tensor([[0.0, 1.0], [float("-inf"), float("-inf")]], requires_grad=True)
+    upstream = torch.tensor([[1.0, -1.0], [-1.0, 1.0]])
 
-    with pytest.raises(ValueError, match="at least one finite key"):
-        NativeJointAttnSoftmaxOp().forward_fp32(scores)
+    probabilities = NativeJointAttnSoftmaxOp().forward_fp32(scores)
+    probabilities.backward(upstream)
+
+    assert tensor_bytes_equal(probabilities[1], torch.zeros(2))
+    assert tensor_bytes_equal(scores.grad[1], torch.zeros(2))
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float64])
@@ -281,6 +285,146 @@ def test_masked_prompt_padding_is_batch_invariant():
     assert tensor_bytes_equal(batched_scores.grad[1], alone_scores.grad)
 
 
+def test_explicit_key_padding_mask_preserves_logical_forward_and_backward_bytes():
+    text_key_count = 73
+    image_key_count = 257
+    prompt_padding_count = 512 - text_key_count
+    padded_image_start = text_key_count + prompt_padding_count
+
+    logical_scores = torch.linspace(
+        -5.0, 5.0, text_key_count + image_key_count, dtype=torch.float32
+    )
+    logical_upstream = torch.linspace(
+        1.0, -1.0, text_key_count + image_key_count, dtype=torch.float32
+    )
+    op = NativeJointAttnSoftmaxOp()
+
+    compact_scores = logical_scores.unsqueeze(0).clone().requires_grad_(True)
+    compact_mask = torch.ones_like(compact_scores, dtype=torch.bool)
+    compact_probabilities = op.forward_fp32(
+        compact_scores,
+        key_padding_mask=compact_mask,
+    )
+    compact_probabilities.backward(logical_upstream.unsqueeze(0))
+
+    padded_scores = torch.cat(
+        [
+            logical_scores[:text_key_count],
+            torch.zeros(prompt_padding_count),
+            logical_scores[text_key_count:],
+        ]
+    ).unsqueeze(0)
+    padded_scores.requires_grad_(True)
+    padded_mask = torch.cat(
+        [
+            torch.ones(text_key_count, dtype=torch.bool),
+            torch.zeros(prompt_padding_count, dtype=torch.bool),
+            torch.ones(image_key_count, dtype=torch.bool),
+        ]
+    ).unsqueeze(0)
+    padded_upstream = torch.cat(
+        [
+            logical_upstream[:text_key_count],
+            torch.zeros(prompt_padding_count),
+            logical_upstream[text_key_count:],
+        ]
+    ).unsqueeze(0)
+    padded_probabilities = op.forward_fp32(
+        padded_scores,
+        key_padding_mask=padded_mask,
+    )
+    padded_probabilities.backward(padded_upstream)
+
+    logical_padded_probabilities = torch.cat(
+        [
+            padded_probabilities[:, :text_key_count],
+            padded_probabilities[:, padded_image_start:],
+        ],
+        dim=-1,
+    )
+    logical_padded_gradients = torch.cat(
+        [
+            padded_scores.grad[:, :text_key_count],
+            padded_scores.grad[:, padded_image_start:],
+        ],
+        dim=-1,
+    )
+
+    assert tensor_bytes_equal(logical_padded_probabilities, compact_probabilities)
+    assert tensor_bytes_equal(logical_padded_gradients, compact_scores.grad)
+    assert torch.count_nonzero(padded_probabilities[:, text_key_count:padded_image_start]) == 0
+    assert torch.count_nonzero(padded_scores.grad[:, text_key_count:padded_image_start]) == 0
+
+
+def test_prompt_padding_preserves_negative_zero_backward_bytes():
+    logical_scores = torch.linspace(-5.0, 5.0, 256, dtype=torch.float32).unsqueeze(0)
+    logical_upstream = torch.full_like(logical_scores, -0.0)
+    operation = NativeJointAttnSoftmaxOp()
+
+    compact_scores = logical_scores.clone().requires_grad_(True)
+    operation.forward_fp32(compact_scores).backward(logical_upstream)
+
+    padded_scores = torch.cat([logical_scores, torch.zeros(1, 512)], dim=-1).requires_grad_(True)
+    key_padding_mask = torch.cat(
+        [
+            torch.ones(1, 256, dtype=torch.bool),
+            torch.zeros(1, 512, dtype=torch.bool),
+        ],
+        dim=-1,
+    )
+    padded_upstream = torch.cat([logical_upstream, torch.zeros(1, 512)], dim=-1)
+    operation.forward_fp32(
+        padded_scores,
+        key_padding_mask=key_padding_mask,
+    ).backward(padded_upstream)
+
+    assert tensor_bytes_equal(padded_scores.grad[:, :256], compact_scores.grad)
+
+
+def test_explicit_key_padding_mask_broadcasts_across_heads_and_queries():
+    scores = torch.linspace(-5.0, 5.0, 60, dtype=torch.float32).reshape(2, 2, 3, 5)
+    key_padding_mask = torch.tensor(
+        [[True, False, True, False, True], [False, True, True, True, False]]
+    )
+    expanded_mask = key_padding_mask[:, None, None, :].expand_as(scores)
+    upstream = torch.linspace(1.0, -1.0, scores.numel()).reshape_as(scores)
+    op = NativeJointAttnSoftmaxOp()
+
+    explicit_scores = scores.clone().requires_grad_(True)
+    explicit_probabilities = op.forward_fp32(
+        explicit_scores,
+        key_padding_mask=key_padding_mask,
+    )
+    explicit_probabilities.backward(upstream)
+
+    materialized_scores = scores.masked_fill(~expanded_mask, float("-inf")).requires_grad_(True)
+    materialized_probabilities = op.forward_fp32(materialized_scores)
+    materialized_probabilities.backward(upstream)
+
+    assert tensor_bytes_equal(explicit_probabilities, materialized_probabilities)
+    assert tensor_bytes_equal(explicit_scores.grad, materialized_scores.grad)
+    assert torch.count_nonzero(explicit_probabilities.masked_select(~expanded_mask)) == 0
+    assert torch.count_nonzero(explicit_scores.grad.masked_select(~expanded_mask)) == 0
+
+
+@pytest.mark.parametrize(
+    "key_padding_mask,match",
+    [
+        (torch.ones(2, 5), "bool dtype"),
+        (torch.ones(3, 5, dtype=torch.bool), "shape"),
+        (torch.ones(2, 4, dtype=torch.bool), "shape"),
+    ],
+)
+def test_rejects_invalid_key_padding_mask(key_padding_mask, match):
+    scores = torch.zeros(2, 3, 5, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=match):
+        NativeJointAttnSoftmaxOp().forward_fp32(
+            scores,
+            key_padding_mask=key_padding_mask,
+        )
+
+
 @pytest.mark.parametrize(
     "dtype,output_fp32",
     [(torch.float32, True), (torch.bfloat16, False), (torch.bfloat16, True)],
@@ -361,6 +505,6 @@ def test_native_trace_records_the_frozen_arithmetic_contract():
         "split_k": False,
         "stream_k": False,
         "tf32": False,
-        "kernel_fingerprint": "joint-attn-softmax-v1-tile256-exp7",
+        "kernel_fingerprint": "joint-attn-softmax-v2-logical-mask-tile256-exp7",
         "fallback": False,
     }

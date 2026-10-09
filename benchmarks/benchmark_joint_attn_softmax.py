@@ -13,6 +13,7 @@ The default key lengths are the three issue #386 image shapes after VAE stride
 Examples:
     python benchmarks/benchmark_joint_attn_softmax.py
     python benchmarks/benchmark_joint_attn_softmax.py --backward
+    python benchmarks/benchmark_joint_attn_softmax.py --valid-text-keys 73
     python benchmarks/benchmark_joint_attn_softmax.py --rows 24576 --backends cuda,triton
 
 ``--backward`` times forward plus ``torch.autograd.grad``, not an isolated
@@ -26,6 +27,7 @@ import json
 import platform
 import sys
 from collections.abc import Callable
+from functools import partial
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -48,6 +50,7 @@ DEFAULT_CASES = {
     "1328x1328": 7401,
     "1664x928": 6544,
 }
+_TEXT_KEY_SLOTS = 512
 
 
 def _parse_cases(raw: str | None) -> dict[str, int]:
@@ -94,18 +97,29 @@ def _time_cuda(call: Callable[[], torch.Tensor], warmup: int, iterations: int) -
     return start.elapsed_time(end) / iterations
 
 
-def _forward_call(op: object, scores: torch.Tensor) -> torch.Tensor:
+def _forward_call(
+    op: object,
+    scores: torch.Tensor,
+    key_padding_mask: torch.Tensor | None,
+) -> torch.Tensor:
     with torch.no_grad():
-        return op.forward(scores)  # type: ignore[attr-defined]
+        return op.forward(  # type: ignore[attr-defined]
+            scores,
+            key_padding_mask=key_padding_mask,
+        )
 
 
 def _backward_call(
     op: object,
     scores: torch.Tensor,
     grad_output: torch.Tensor,
+    key_padding_mask: torch.Tensor | None,
 ) -> torch.Tensor:
     differentiable_scores = scores.detach().requires_grad_(True)
-    probabilities = op.forward(differentiable_scores)  # type: ignore[attr-defined]
+    probabilities = op.forward(  # type: ignore[attr-defined]
+        differentiable_scores,
+        key_padding_mask=key_padding_mask,
+    )
     (grad_scores,) = torch.autograd.grad(probabilities, differentiable_scores, grad_output)
     return grad_scores
 
@@ -131,6 +145,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("joint_attn_softmax benchmark requires an NVIDIA CUDA GPU")
     if args.rows <= 0 or args.warmup < 0 or args.iterations <= 0:
         raise ValueError("rows and iterations must be positive; warmup must be non-negative")
+    if args.valid_text_keys is not None and not 0 <= args.valid_text_keys <= _TEXT_KEY_SLOTS:
+        raise ValueError(f"valid-text-keys must be between 0 and {_TEXT_KEY_SLOTS}")
 
     dtype = {"bf16": torch.bfloat16, "fp32": torch.float32}[args.dtype]
     backends = _load_backends(args.backends)
@@ -139,35 +155,49 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     records: list[dict[str, Any]] = []
     for shape_name, key_length in args.cases.items():
+        if args.valid_text_keys is not None and key_length < _TEXT_KEY_SLOTS:
+            raise ValueError(
+                f"{shape_name} has {key_length} keys; prompt masking requires at least "
+                f"{_TEXT_KEY_SLOTS}"
+            )
+        score_shape = (1, args.rows, 1, key_length)
         generator = torch.Generator(device="cuda").manual_seed(386 + key_length + args.rows)
         scores = torch.randn(
-            (args.rows, key_length),
+            score_shape,
             generator=generator,
             device="cuda",
             dtype=dtype,
         )
         grad_output = torch.randn(
-            (args.rows, key_length),
+            score_shape,
             generator=generator,
             device="cuda",
             dtype=dtype,
         )
+        key_padding_mask = None
+        masked_prompt_keys = 0
+        if args.valid_text_keys is not None:
+            key_padding_mask = torch.ones((1, key_length), device="cuda", dtype=torch.bool)
+            key_padding_mask[:, args.valid_text_keys : _TEXT_KEY_SLOTS] = False
+            masked_prompt_keys = _TEXT_KEY_SLOTS - args.valid_text_keys
         reference = (
-            _backward_call(backends["cuda"], scores, grad_output)
+            _backward_call(backends["cuda"], scores, grad_output, key_padding_mask)
             if args.backward
-            else _forward_call(backends["cuda"], scores)
+            else _forward_call(backends["cuda"], scores, key_padding_mask)
         )
 
         for backend_name, op in backends.items():
-            call = (
-                (
-                    lambda op=op, scores=scores, grad_output=grad_output: _backward_call(
-                        op, scores, grad_output
-                    )
+            call: Callable[[], torch.Tensor]
+            if args.backward:
+                call = partial(
+                    _backward_call,
+                    op,
+                    scores,
+                    grad_output,
+                    key_padding_mask,
                 )
-                if args.backward
-                else (lambda op=op, scores=scores: _forward_call(op, scores))
-            )
+            else:
+                call = partial(_forward_call, op, scores, key_padding_mask)
             actual = call()
             if not tensor_bytes_equal(actual, reference):
                 raise AssertionError(
@@ -184,6 +214,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     "dtype": args.dtype,
                     "direction": "backward" if args.backward else "forward",
                     "backend": backend_name,
+                    "valid_text_keys": args.valid_text_keys,
+                    "masked_prompt_keys": masked_prompt_keys,
                     "latency_ms": latency_ms,
                     "cuda_speed_ratio": None,
                     "kernel_fingerprint": fingerprint,
@@ -201,8 +233,14 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         record["cuda_speed_ratio"] = baseline / record["latency_ms"]
 
     return {
-        "schema_version": "rlkernel.joint_attn_softmax_benchmark.v1",
+        "schema_version": "rlkernel.joint_attn_softmax_benchmark.v2",
         "environment": _environment(),
+        "configuration": {
+            "rows": args.rows,
+            "dtype": args.dtype,
+            "direction": "backward" if args.backward else "forward",
+            "valid_text_keys": args.valid_text_keys,
+        },
         "results": records,
     }
 
@@ -212,6 +250,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rows", type=int, default=24, help="flattened B * H * Q rows")
     parser.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--backward", action="store_true", help="time forward plus autograd.grad")
+    parser.add_argument(
+        "--valid-text-keys",
+        type=int,
+        help="mask prompt key slots from this count up to position 512",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument(

@@ -15,6 +15,9 @@ from rl_engine.kernels.registry import kernel_registry
 
 softmax = kernel_registry.get_op("joint_attn_softmax", device=scores.device)
 probabilities = softmax(scores)
+
+# True keeps a key; False marks prompt padding shared by this batch item.
+probabilities = softmax(scores, key_padding_mask=key_padding_mask)
 ```
 
 Direct backend wrappers also expose `forward_fp32(scores)` when callers need
@@ -33,9 +36,10 @@ FP32 probabilities independently of the input dtype.
 
 | Argument / result | Shape | Dtype | Requirements |
 | --- | --- | --- | --- |
-| `scores` | `[..., K]` | BF16 or FP32 | `K > 0`; contiguous or strided; at least one finite key per row |
-| `forward(scores)` | Same as `scores` | Same as `scores` | Normalized over the final dimension |
-| `forward_fp32(scores)` | Same as `scores` | FP32 | Normalized over the final dimension |
+| `scores` | `[..., K]` | BF16 or FP32 | `K > 0`; contiguous or strided; `-inf` masking is allowed |
+| `key_padding_mask` | `[B, K]` | bool or `None` | Optional; same device as `scores`; `True` = valid key, `False` = prompt padding |
+| `forward(scores)` | Same as `scores` | Same as `scores` | Normalized over the final dimension; zero for fully masked rows |
+| `forward_fp32(scores)` | Same as `scores` | FP32 | Normalized over the final dimension; zero for fully masked rows |
 | `scores.grad` | Same as `scores` | Same as `scores` | First-order backward only |
 
 The backward formula is:
@@ -44,10 +48,13 @@ The backward formula is:
 dS = P * (dP - fixed_sum(P * dP))
 ```
 
-The operator is non-causal and has no mask argument. Callers materialize masks
-as `-inf` in `scores` before this stage. Output strides and contiguity are not
-part of the public contract; callers that require contiguous storage should
-call `.contiguous()`.
+The operator is non-causal. Without `key_padding_mask`, callers may still
+materialize masks as `-inf` in `scores`. When a mask is provided, valid keys are
+assigned a logical order before the fixed reduction and results are written back
+to their physical positions. This keeps the arithmetic order unchanged when
+prompt padding moves the image keys. Output strides and contiguity are not part
+of the public contract; callers that require contiguous storage should call
+`.contiguous()`.
 
 ## Dispatch Behavior
 
@@ -73,10 +80,12 @@ owns one complete row. Tiles are visited from left to right and their online
 `(max, sum)` states are merged in that order. Each padded tile uses the binary
 reduction tree `128, 64, 32, 16, 8, 4, 2, 1`.
 
-An all-`-inf` tile contributes nothing and is skipped; the first tile with a
-finite key initializes the online state. This supports rows whose first one or
-two complete tiles are masked. Backward uses the same tile tree and
-left-to-right merge for `sum(P * dP)`.
+With `key_padding_mask`, tiles are formed from valid keys in their original
+relative order instead of their padded physical positions. An all-`-inf` tile
+contributes nothing and is skipped; the first tile with a finite key initializes
+the online state. If the entire row is masked, forward returns zero probabilities
+and backward returns zero gradients. Backward reuses the forward key mapping and
+the same tile tree and left-to-right merge for `sum(P * dP)`.
 
 PyTorch, CUDA, and Triton use the same FP32 range reduction and degree-seven
 exponential polynomial. CUDA and Triton request individually rounded FP32
@@ -84,7 +93,7 @@ operations. There is no Split-K, Stream-K, atomic partial accumulation, TF32,
 fast math, or batch-dependent launch choice. BF16 conversion happens once, at
 the final output or gradient write.
 
-The shared fingerprint is `joint-attn-softmax-v1-tile256-exp7`. It identifies
+The shared fingerprint is `joint-attn-softmax-v2-logical-mask-tile256-exp7`. It identifies
 the arithmetic contract, not a compiled binary hash.
 
 ### Comparison rules
@@ -100,8 +109,10 @@ reference. Invariance tests compare the same row alone and in batches with
 different companions and positions. They also cover:
 
 - `K=256` versus `K=257` with an added `-inf` key;
-- 512 text positions with 73 valid tokens and masked prompt padding;
+- compact and padded layouts of the same 73 text plus 257 image keys, using an
+  explicit `[B, K]` key-padding mask;
 - one or two fully masked leading tiles followed by finite keys;
+- fully masked rows with zero forward output and zero backward gradients;
 - forward and backward at all three Qwen-Image acceptance lengths.
 
 With 512 text positions, VAE stride 8, and 2x2 latent packing, those lengths
@@ -125,18 +136,34 @@ The benchmark checks output and gradient bytes against CUDA before timing:
 ```bash
 python benchmarks/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype bf16
 python benchmarks/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype bf16 --backward
-# Repeat both commands with --dtype fp32.
+python benchmarks/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype bf16 \
+  --valid-text-keys 73
+python benchmarks/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype bf16 \
+  --backward --valid-text-keys 73
+# Repeat the four commands with --dtype fp32.
 ```
 
 `--rows` controls flattened `B * H * Q` and defaults to 24. `--backward` times
-forward plus `torch.autograd.grad`, not the backward kernel alone. The JSON
-output records Python, PyTorch, Triton, CUDA runtime, GPU, compute capability,
-latency, and kernel fingerprint.
+forward plus `torch.autograd.grad`, not the backward kernel alone.
+`--valid-text-keys 73` keeps the first 73 of the 512 prompt slots and masks the
+remaining 439 while leaving image keys valid. The JSON output records this
+layout together with Python, PyTorch, Triton, CUDA runtime, GPU, compute
+capability, latency, and kernel fingerprint.
 
 Fixed tile sizes `64/128/256/512` were compared offline on an RTX 5060. The
 best size differed by backend, while 256 gave a reasonable shared CUDA/Triton
 balance. The production arithmetic contract therefore keeps `TILE_K=256` and
 does not autotune it at runtime.
+
+The explicit-mask path builds one `[B, K]` logical-to-physical map and reuses it
+for every head/query row and for backward. On the same RTX 5060, BF16
+`[1, 24, 1, 7401]` measurements included mapping construction. Each value below
+is the median of three runs with 10 warmups and 200 measured iterations:
+
+| Backend | Forward, no mask | Forward, mask | Forward + backward, no mask | Forward + backward, mask |
+| --- | ---: | ---: | ---: | ---: |
+| CUDA | 0.0296 ms | 0.0540 ms | 0.1904 ms | 0.2627 ms |
+| Triton | 0.0702 ms | 0.1025 ms | 0.2696 ms | 0.3930 ms |
 
 ## Tests
 
@@ -162,17 +189,19 @@ The validation environment was WSL Ubuntu, Python 3.12.13, PyTorch
 2.13.0+cu130, Triton 3.7.1, NVIDIA driver 591.86, CUDA toolkit/runtime 13.0,
 GCC 13.3.0, and an NVIDIA GeForce RTX 5060 (compute capability 12.0).
 
-On 2026-10-08, the seven-file suite passed **140 tests, with 0 skipped, 0
+On 2026-10-09, the seven-file suite passed **164 tests, with 0 skipped, 0
 failures, and 0 errors**. All three `check_operator.py` runs passed with
 gradient checks. Registry dispatch selected the CUDA extension with fingerprint
-`joint-attn-softmax-v1-tile256-exp7` and no fallback. Separate BF16/FP32
+`joint-attn-softmax-v2-logical-mask-tile256-exp7` and no fallback. Separate BF16/FP32
 forward/backward benchmark runs passed strict CUDA↔Triton byte checks at all
 three key lengths. These results qualify that environment only.
 
 ## Known Limitations
 
-- Masks must already be represented as `-inf` scores; there is no mask argument.
-- NaN, `+inf`, and fully masked rows are unsupported.
+- Byte invariance across different prompt-padding layouts requires the explicit
+  `key_padding_mask`; materialized `-inf` remains supported but follows physical
+  key positions.
+- NaN and `+inf` are unsupported.
 - Only first-order backward is covered.
 - Output layout is not guaranteed to preserve input strides.
 - ROCm, MUSA, and NPU use the portable fallback but are not byte-equality qualified.

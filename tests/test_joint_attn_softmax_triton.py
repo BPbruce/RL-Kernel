@@ -90,6 +90,46 @@ def test_backward_bf16_matches_cpu_reference_byte_for_byte():
     assert tensor_bytes_equal(actual_scores.grad.cpu(), expected_scores.grad)
 
 
+@pytest.mark.parametrize(
+    "dtype,output_fp32",
+    [(torch.float32, True), (torch.bfloat16, False), (torch.bfloat16, True)],
+)
+def test_fully_masked_row_returns_zero_probabilities_and_gradients(dtype, output_fp32):
+    from rl_engine.kernels.ops.pytorch.attention.joint_attn_softmax import NativeJointAttnSoftmaxOp
+    from rl_engine.kernels.ops.triton.attention.joint_attn_softmax import TritonJointAttnSoftmaxOp
+
+    finite_row = torch.linspace(-4.0, 4.0, 513, dtype=torch.float32).to(dtype)
+    scores = torch.stack([finite_row, finite_row.new_full((513,), float("-inf"))])
+    upstream = torch.linspace(-1.0, 1.0, 513, dtype=torch.float32).repeat(2, 1)
+    if not output_fp32:
+        upstream = upstream.to(dtype)
+
+    expected_scores = scores.clone().requires_grad_(True)
+    reference_op = NativeJointAttnSoftmaxOp()
+    expected_probabilities = (
+        reference_op.forward_fp32(expected_scores)
+        if output_fp32
+        else reference_op.forward(expected_scores)
+    )
+    expected_probabilities.backward(upstream)
+
+    actual_scores = scores.cuda().requires_grad_(True)
+    triton_op = TritonJointAttnSoftmaxOp()
+    actual_probabilities = (
+        triton_op.forward_fp32(actual_scores) if output_fp32 else triton_op.forward(actual_scores)
+    )
+    actual_probabilities.backward(upstream.cuda())
+
+    assert tensor_bytes_equal(actual_probabilities.cpu(), expected_probabilities)
+    assert tensor_bytes_equal(actual_scores.grad.cpu(), expected_scores.grad)
+    assert tensor_bytes_equal(
+        actual_probabilities[1].cpu(), torch.zeros_like(expected_probabilities[1])
+    )
+    assert tensor_bytes_equal(
+        actual_scores.grad[1].cpu(), torch.zeros_like(expected_scores.grad[1])
+    )
+
+
 def test_registry_falls_back_to_triton_when_cuda_symbol_is_unavailable(monkeypatch):
     from rl_engine.kernels.ops.base import _C
     from rl_engine.kernels.ops.triton.attention.joint_attn_softmax import TritonJointAttnSoftmaxOp
@@ -113,7 +153,7 @@ def test_triton_trace_records_the_frozen_arithmetic_contract():
         "split_k": False,
         "stream_k": False,
         "tf32": False,
-        "kernel_fingerprint": "joint-attn-softmax-v1-tile256-exp7",
+        "kernel_fingerprint": "joint-attn-softmax-v2-logical-mask-tile256-exp7",
         "fallback": False,
     }
 
@@ -181,6 +221,191 @@ def test_masked_prompt_padding_is_batch_invariant():
 
     assert tensor_bytes_equal(batched_probabilities[1], alone_probabilities)
     assert tensor_bytes_equal(batched_scores.grad[1], alone_scores.grad)
+
+
+@pytest.mark.parametrize("upstream_kind", ["regular", "negative_zero"])
+@pytest.mark.parametrize(
+    "dtype,output_fp32",
+    [(torch.float32, True), (torch.bfloat16, False), (torch.bfloat16, True)],
+)
+def test_explicit_key_padding_mask_preserves_prompt_padding_bytes_across_backends(
+    upstream_kind, dtype, output_fp32
+):
+    from rl_engine.kernels.ops.cuda.attention.joint_attn_softmax import JointAttnSoftmaxCudaOp
+    from rl_engine.kernels.ops.pytorch.attention.joint_attn_softmax import NativeJointAttnSoftmaxOp
+    from rl_engine.kernels.ops.triton.attention.joint_attn_softmax import TritonJointAttnSoftmaxOp
+
+    text_key_count = 73
+    image_key_count = 257
+    prompt_padding_count = 512 - text_key_count
+    image_start = text_key_count + prompt_padding_count
+    logical_scores = torch.linspace(-5.0, 5.0, text_key_count + image_key_count).to(dtype)
+    upstream_dtype = torch.float32 if output_fp32 else dtype
+    logical_upstream = (
+        torch.linspace(1.0, -1.0, logical_scores.numel()).to(upstream_dtype)
+        if upstream_kind == "regular"
+        else torch.full((logical_scores.numel(),), -0.0, dtype=upstream_dtype)
+    )
+
+    padded_scores = torch.cat(
+        [
+            logical_scores[:text_key_count],
+            logical_scores.new_zeros(prompt_padding_count),
+            logical_scores[text_key_count:],
+        ]
+    ).unsqueeze(0)
+    key_padding_mask = torch.cat(
+        [
+            torch.ones(text_key_count, dtype=torch.bool),
+            torch.zeros(prompt_padding_count, dtype=torch.bool),
+            torch.ones(image_key_count, dtype=torch.bool),
+        ]
+    ).unsqueeze(0)
+    padded_upstream = torch.cat(
+        [
+            logical_upstream[:text_key_count],
+            logical_upstream.new_zeros(prompt_padding_count),
+            logical_upstream[text_key_count:],
+        ]
+    ).unsqueeze(0)
+
+    compact_scores = logical_scores.unsqueeze(0).clone().requires_grad_(True)
+    reference = NativeJointAttnSoftmaxOp()
+    compact_probabilities = (
+        reference.forward_fp32(compact_scores) if output_fp32 else reference.forward(compact_scores)
+    )
+    compact_probabilities.backward(logical_upstream.unsqueeze(0))
+
+    results = []
+    for operation in (
+        NativeJointAttnSoftmaxOp(),
+        JointAttnSoftmaxCudaOp(),
+        TritonJointAttnSoftmaxOp(),
+    ):
+        device = "cpu" if isinstance(operation, NativeJointAttnSoftmaxOp) else "cuda"
+        backend_scores = padded_scores.to(device).detach().requires_grad_(True)
+        probabilities = (
+            operation.forward_fp32(
+                backend_scores,
+                key_padding_mask=key_padding_mask.to(device),
+            )
+            if output_fp32
+            else operation.forward(
+                backend_scores,
+                key_padding_mask=key_padding_mask.to(device),
+            )
+        )
+        probabilities.backward(padded_upstream.to(device))
+        results.append((probabilities.cpu(), backend_scores.grad.cpu()))
+
+    for probabilities, gradients in results:
+        logical_probabilities = torch.cat(
+            [probabilities[:, :text_key_count], probabilities[:, image_start:]], dim=-1
+        )
+        logical_gradients = torch.cat(
+            [gradients[:, :text_key_count], gradients[:, image_start:]], dim=-1
+        )
+        assert tensor_bytes_equal(logical_probabilities, compact_probabilities)
+        assert tensor_bytes_equal(logical_gradients, compact_scores.grad)
+        assert torch.count_nonzero(probabilities[:, text_key_count:image_start]) == 0
+        assert torch.count_nonzero(gradients[:, text_key_count:image_start]) == 0
+
+
+def test_masked_benchmark_reports_prompt_layout():
+    from argparse import Namespace
+
+    from benchmarks.benchmark_joint_attn_softmax import run_benchmark
+
+    report = run_benchmark(
+        Namespace(
+            rows=2,
+            dtype="bf16",
+            backward=False,
+            warmup=0,
+            iterations=1,
+            backends=["cuda", "triton"],
+            cases={"synthetic": 513},
+            valid_text_keys=73,
+        )
+    )
+
+    assert report["configuration"]["valid_text_keys"] == 73
+    assert all(record["masked_prompt_keys"] == 439 for record in report["results"])
+    assert all(record["byte_equal_to_cuda"] for record in report["results"])
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("output_fp32", [False, True])
+def test_explicit_key_padding_mask_uses_each_batch_layout_across_backends(dtype, output_fp32):
+    from rl_engine.kernels.ops.cuda.attention.joint_attn_softmax import JointAttnSoftmaxCudaOp
+    from rl_engine.kernels.ops.pytorch.attention.joint_attn_softmax import NativeJointAttnSoftmaxOp
+    from rl_engine.kernels.ops.triton.attention.joint_attn_softmax import TritonJointAttnSoftmaxOp
+
+    generator = torch.Generator().manual_seed(386)
+    scores = torch.randn(3, 2, 3, 513, generator=generator).to(dtype)
+    upstream = torch.randn(3, 2, 3, 513, generator=generator)
+    if not output_fp32:
+        upstream = upstream.to(dtype)
+    key_padding_mask = torch.ones(3, 513, dtype=torch.bool)
+    key_padding_mask[0, 73:256] = False
+    key_padding_mask[1, :128] = False
+    key_padding_mask[1, 400:] = False
+    key_padding_mask[2] = False
+    expanded_mask = key_padding_mask[:, None, None, :].expand_as(scores)
+
+    expected_scores = scores.clone().requires_grad_(True)
+    reference = NativeJointAttnSoftmaxOp()
+    expected_probabilities = (
+        reference.forward_fp32(expected_scores, key_padding_mask=key_padding_mask)
+        if output_fp32
+        else reference.forward(expected_scores, key_padding_mask=key_padding_mask)
+    )
+    expected_probabilities.backward(upstream)
+
+    for operation in (JointAttnSoftmaxCudaOp(), TritonJointAttnSoftmaxOp()):
+        actual_scores = scores.cuda().requires_grad_(True)
+        actual_probabilities = (
+            operation.forward_fp32(
+                actual_scores,
+                key_padding_mask=key_padding_mask.cuda(),
+            )
+            if output_fp32
+            else operation.forward(
+                actual_scores,
+                key_padding_mask=key_padding_mask.cuda(),
+            )
+        )
+        actual_probabilities.backward(upstream.cuda())
+
+        assert tensor_bytes_equal(actual_probabilities.cpu(), expected_probabilities)
+        assert tensor_bytes_equal(actual_scores.grad.cpu(), expected_scores.grad)
+        assert torch.count_nonzero(actual_probabilities.masked_select(~expanded_mask.cuda())) == 0
+        assert torch.count_nonzero(actual_scores.grad.masked_select(~expanded_mask.cuda())) == 0
+
+
+def test_explicit_key_padding_mask_preserves_empty_batch_across_backends():
+    from rl_engine.kernels.ops.cuda.attention.joint_attn_softmax import JointAttnSoftmaxCudaOp
+    from rl_engine.kernels.ops.pytorch.attention.joint_attn_softmax import NativeJointAttnSoftmaxOp
+    from rl_engine.kernels.ops.triton.attention.joint_attn_softmax import TritonJointAttnSoftmaxOp
+
+    for operation in (
+        NativeJointAttnSoftmaxOp(),
+        JointAttnSoftmaxCudaOp(),
+        TritonJointAttnSoftmaxOp(),
+    ):
+        device = "cpu" if isinstance(operation, NativeJointAttnSoftmaxOp) else "cuda"
+        scores = torch.empty(0, 2, 3, 257, device=device, requires_grad=True)
+        key_padding_mask = torch.empty(0, 257, device=device, dtype=torch.bool)
+
+        probabilities = operation.forward_fp32(
+            scores,
+            key_padding_mask=key_padding_mask,
+        )
+        probabilities.sum().backward()
+
+        assert probabilities.shape == scores.shape
+        assert scores.grad is not None
+        assert scores.grad.shape == scores.shape
 
 
 @pytest.mark.parametrize(

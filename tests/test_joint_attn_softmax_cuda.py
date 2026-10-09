@@ -79,6 +79,45 @@ def test_forward_bf16_casts_once_at_final_cuda_write():
     assert tensor_bytes_equal(probabilities, expected)
 
 
+@pytest.mark.parametrize(
+    "dtype,output_fp32",
+    [(torch.float32, True), (torch.bfloat16, False), (torch.bfloat16, True)],
+)
+def test_fully_masked_row_returns_zero_probabilities_and_gradients(dtype, output_fp32):
+    from rl_engine.kernels.ops.cuda.attention.joint_attn_softmax import JointAttnSoftmaxCudaOp
+    from rl_engine.kernels.ops.pytorch.attention.joint_attn_softmax import NativeJointAttnSoftmaxOp
+
+    valid_row = torch.linspace(-4.0, 4.0, 513, dtype=dtype)
+    masked_row = torch.full((513,), float("-inf"), dtype=dtype)
+    scores = torch.stack([valid_row, masked_row])
+    upstream = torch.linspace(-1.0, 1.0, 513, dtype=torch.float32).repeat(2, 1)
+    if not output_fp32:
+        upstream = upstream.to(dtype)
+
+    expected_scores = scores.clone().requires_grad_(True)
+    reference = NativeJointAttnSoftmaxOp()
+    expected_probabilities = (
+        reference.forward_fp32(expected_scores) if output_fp32 else reference(expected_scores)
+    )
+    expected_probabilities.backward(upstream)
+
+    actual_scores = scores.cuda().requires_grad_(True)
+    operation = JointAttnSoftmaxCudaOp()
+    actual_probabilities = (
+        operation.forward_fp32(actual_scores) if output_fp32 else operation(actual_scores)
+    )
+    actual_probabilities.backward(upstream.cuda())
+
+    assert tensor_bytes_equal(actual_probabilities.cpu(), expected_probabilities)
+    assert tensor_bytes_equal(actual_scores.grad.cpu(), expected_scores.grad)
+    assert tensor_bytes_equal(
+        actual_probabilities[1].cpu(), torch.zeros_like(expected_probabilities[1])
+    )
+    assert tensor_bytes_equal(
+        actual_scores.grad[1].cpu(), torch.zeros_like(expected_scores.grad[1])
+    )
+
+
 @pytest.mark.parametrize("leading_masked_tiles", [1, 2])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("output_fp32", [False, True])
@@ -275,7 +314,7 @@ def test_cuda_trace_records_the_frozen_arithmetic_contract():
         "split_k": False,
         "stream_k": False,
         "tf32": False,
-        "kernel_fingerprint": "joint-attn-softmax-v1-tile256-exp7",
+        "kernel_fingerprint": "joint-attn-softmax-v2-logical-mask-tile256-exp7",
         "fallback": False,
     }
 
