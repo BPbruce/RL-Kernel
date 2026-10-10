@@ -56,12 +56,15 @@ _TEXT_KEY_SLOTS = 512
 
 
 def _git_commit() -> str:
-    completed = subprocess.run(
-        ["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return "unavailable"
     return completed.stdout.strip() if completed.returncode == 0 else "unavailable"
 
 
