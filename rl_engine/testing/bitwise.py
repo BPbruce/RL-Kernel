@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 RL-Kernel Contributors
+"""Compatibility import; the canonical module is loaded below."""
 
-"""Exact tensor comparison for byte-level kernel contracts."""
+import importlib
+import sys
+from pathlib import Path
 
-import torch
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+if __name__ == "__main__":
+    import runpy
 
-def tensor_bytes_equal(actual: torch.Tensor, expected: torch.Tensor) -> bool:
-    """Compare logical tensor contents, including floating-point signed zeros."""
-    if actual.shape != expected.shape or actual.dtype != expected.dtype:
-        return False
-
-    actual_bytes = actual.detach().to("cpu").contiguous().reshape(-1).view(torch.uint8)
-    expected_bytes = expected.detach().to("cpu").contiguous().reshape(-1).view(torch.uint8)
-    return torch.equal(actual_bytes, expected_bytes)
+    runpy.run_module("rl_engine.validation.common.bitwise", run_name="__main__")
+else:
+    sys.modules[__name__] = importlib.import_module("rl_engine.validation.common.bitwise")

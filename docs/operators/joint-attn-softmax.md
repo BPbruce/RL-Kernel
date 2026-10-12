@@ -11,7 +11,7 @@ fixed-order backward.
 ## Entry Point
 
 ```python
-from rl_engine.kernels.registry import kernel_registry
+from rl_engine.runtime.registry import kernel_registry
 
 softmax = kernel_registry.get_op("joint_attn_softmax", device=scores.device)
 probabilities = softmax(scores)
@@ -134,13 +134,13 @@ when CUDA is unavailable or free GPU memory is insufficient.
 The benchmark checks output and gradient bytes against CUDA before timing:
 
 ```bash
-python benchmarks/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype bf16 \
+python benchmarks/operators/attention/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype bf16 \
   --warmup 10 --iterations 200
-python benchmarks/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype bf16 \
+python benchmarks/operators/attention/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype bf16 \
   --backward --warmup 10 --iterations 200
-python benchmarks/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype bf16 \
+python benchmarks/operators/attention/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype bf16 \
   --valid-text-keys 73 --warmup 10 --iterations 200
-python benchmarks/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype bf16 \
+python benchmarks/operators/attention/benchmark_joint_attn_softmax.py --backends cuda,triton --dtype bf16 \
   --backward --valid-text-keys 73 --warmup 10 --iterations 200
 # Repeat the four commands with --dtype fp32.
 ```
@@ -173,19 +173,19 @@ is the median of three separate benchmark invocations, each with 10 warmups and
 
 ```bash
 python -m pytest -p no:cacheprovider \
-  tests/test_joint_attn_softmax.py \
-  tests/test_joint_attn_softmax_cuda.py \
-  tests/test_joint_attn_softmax_triton.py \
-  tests/test_joint_attn_softmax_registry.py \
-  tests/test_joint_attn_softmax_full_shapes.py \
-  tests/test_build_platform_collectives.py \
-  tests/test_operator_inputs.py -q
+  tests/reference/test_joint_attn_softmax.py \
+  tests/backends/cuda/test_joint_attn_softmax_cuda.py \
+  tests/backends/cuda/test_joint_attn_softmax_triton.py \
+  tests/runtime/test_joint_attn_softmax_registry.py \
+  tests/ops/attention/test_joint_attn_softmax_full_shapes.py \
+  tests/build/test_build_platform_collectives.py \
+  tests/validation/operators/test_operator_inputs.py -q
 
-python scripts/check_operator.py --op joint_attn_softmax --candidate pytorch \
+python tools/validation/operators/check_operator.py --op joint_attn_softmax --candidate pytorch \
   --device cpu --dtype fp32 --batch 2 --seq 257 --check-grad
-python scripts/check_operator.py --op joint_attn_softmax --candidate cuda \
+python tools/validation/operators/check_operator.py --op joint_attn_softmax --candidate cuda \
   --device cuda --dtype bf16 --batch 2 --seq 257 --check-grad
-python scripts/check_operator.py --op joint_attn_softmax --candidate triton \
+python tools/validation/operators/check_operator.py --op joint_attn_softmax --candidate triton \
   --device cuda --dtype bf16 --batch 2 --seq 257 --check-grad
 ```
 
@@ -193,7 +193,7 @@ The validation environment was WSL Ubuntu, Python 3.12.13, PyTorch
 2.13.0+cu130, Triton 3.7.1, NVIDIA driver 591.86, CUDA toolkit/runtime 13.0,
 GCC 13.3.0, and an NVIDIA GeForce RTX 5060 (compute capability 12.0).
 
-On 2026-10-09, the seven-file suite passed **170 tests, with 0 skipped, 0
+On 2026-10-12, the seven-file suite passed **173 tests, with 0 skipped, 0
 failures, and 0 errors**. All three `check_operator.py` runs passed with
 gradient checks. Registry dispatch selected the CUDA extension with fingerprint
 `joint-attn-softmax-v2-logical-mask-tile256-exp7` and no fallback. Separate BF16/FP32
