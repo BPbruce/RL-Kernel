@@ -38,7 +38,7 @@ from typing import Any
 import torch
 
 # Allow direct execution from a source checkout without an editable install.
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO_ROOT))
 
 from rl_engine.backends.cuda.attention.joint_attn_softmax import (  # noqa: E402
