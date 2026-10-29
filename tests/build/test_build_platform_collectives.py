@@ -7,6 +7,7 @@ import os
 import runpy
 from typing import Any
 
+import pytest
 import setuptools
 import torch
 from torch.utils import cpp_extension
@@ -15,7 +16,11 @@ from build_tools.extensions import _resolve_package_data_source, get_cmdclass
 
 
 def _load_extension_config(
-    monkeypatch, *, hip: str | None, fast_math: bool = False
+    monkeypatch,
+    *,
+    hip: str | None,
+    fast_math: bool = False,
+    nvcc_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     captured: dict[str, Any] = {}
 
@@ -34,6 +39,10 @@ def _load_extension_config(
         monkeypatch.setattr(torch.musa, "is_available", lambda: False)
     monkeypatch.delenv("KERNEL_ALIGN_FORCE_SM90", raising=False)
     monkeypatch.delenv("KERNEL_ALIGN_DET_GEMM_SM90", raising=False)
+    for name in ("NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS", "TORCH_NVCC_FLAGS"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in (nvcc_env or {}).items():
+        monkeypatch.setenv(name, value)
     if fast_math:
         monkeypatch.setenv("KERNEL_ALIGN_USE_FAST_MATH", "1")
     else:
@@ -76,6 +85,88 @@ def test_fast_math_build_excludes_bit_reference_softmax(monkeypatch) -> None:
 
     assert "csrc/cuda/attention/joint_attn_softmax.cu" not in extension["sources"]
     assert "-DKERNEL_ALIGN_WITH_JOINT_ATTN_SOFTMAX" not in extension["extra_compile_args"]["cxx"]
+
+
+@pytest.mark.parametrize("variable", ["NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS"])
+def test_external_fast_math_flags_exclude_bit_reference_softmax(monkeypatch, variable) -> None:
+    with pytest.warns(RuntimeWarning, match="joint-attention softmax CUDA bit reference"):
+        extension = _load_extension_config(
+            monkeypatch,
+            hip=None,
+            nvcc_env={variable: "--use_fast_math"},
+        )
+
+    assert "csrc/cuda/attention/joint_attn_softmax.cu" not in extension["sources"]
+    assert "-DKERNEL_ALIGN_WITH_JOINT_ATTN_SOFTMAX" not in extension["extra_compile_args"]["cxx"]
+
+
+@pytest.mark.parametrize(
+    ("variable", "flags"),
+    [
+        ("NVCC_PREPEND_FLAGS", "--ftz=true"),
+        ("NVCC_APPEND_FLAGS", "--ftz true"),
+        ("TORCH_NVCC_FLAGS", "--prec-div=false"),
+        ("TORCH_NVCC_FLAGS", "--prec-sqrt false"),
+        ("NVCC_APPEND_FLAGS", '"-O2 --use_fast_math"'),
+    ],
+)
+def test_external_relaxed_math_spellings_exclude_bit_reference_softmax(
+    monkeypatch, variable, flags
+) -> None:
+    with pytest.warns(RuntimeWarning, match="joint-attention softmax CUDA bit reference"):
+        extension = _load_extension_config(
+            monkeypatch,
+            hip=None,
+            nvcc_env={variable: flags},
+        )
+
+    assert "csrc/cuda/attention/joint_attn_softmax.cu" not in extension["sources"]
+    assert "-DKERNEL_ALIGN_WITH_JOINT_ATTN_SOFTMAX" not in extension["extra_compile_args"]["cxx"]
+
+
+@pytest.mark.parametrize(
+    "flags",
+    ["@external.flags", "--options-file=external.flags", "-optf external.flags"],
+)
+def test_uncheckable_external_options_file_excludes_bit_reference_softmax(
+    monkeypatch, flags
+) -> None:
+    with pytest.warns(RuntimeWarning, match="joint-attention softmax CUDA bit reference"):
+        extension = _load_extension_config(
+            monkeypatch,
+            hip=None,
+            nvcc_env={"NVCC_APPEND_FLAGS": flags},
+        )
+
+    assert "csrc/cuda/attention/joint_attn_softmax.cu" not in extension["sources"]
+    assert "-DKERNEL_ALIGN_WITH_JOINT_ATTN_SOFTMAX" not in extension["extra_compile_args"]["cxx"]
+
+
+def test_unparseable_external_nvcc_flags_exclude_bit_reference_softmax(monkeypatch) -> None:
+    with pytest.warns(RuntimeWarning, match="NVCC_APPEND_FLAGS cannot be parsed"):
+        extension = _load_extension_config(
+            monkeypatch,
+            hip=None,
+            nvcc_env={"NVCC_APPEND_FLAGS": "'unterminated"},
+        )
+
+    assert "csrc/cuda/attention/joint_attn_softmax.cu" not in extension["sources"]
+    assert "-DKERNEL_ALIGN_WITH_JOINT_ATTN_SOFTMAX" not in extension["extra_compile_args"]["cxx"]
+
+
+@pytest.mark.parametrize(
+    "flags",
+    ["-lineinfo", "--ftz=false --prec-div=true --prec-sqrt true"],
+)
+def test_safe_external_nvcc_flags_keep_bit_reference_softmax(monkeypatch, flags) -> None:
+    extension = _load_extension_config(
+        monkeypatch,
+        hip=None,
+        nvcc_env={"NVCC_APPEND_FLAGS": flags},
+    )
+
+    assert "csrc/cuda/attention/joint_attn_softmax.cu" in extension["sources"]
+    assert "-DKERNEL_ALIGN_WITH_JOINT_ATTN_SOFTMAX" in extension["extra_compile_args"]["cxx"]
 
 
 def test_package_data_json_links_resolve_to_real_content(tmp_path) -> None:

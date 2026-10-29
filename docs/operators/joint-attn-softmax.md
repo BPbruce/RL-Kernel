@@ -93,6 +93,18 @@ operations. There is no Split-K, Stream-K, atomic partial accumulation, TF32,
 fast math, or batch-dependent launch choice. BF16 conversion happens once, at
 the final output or gradient write.
 
+The PyTorch CPU reference also requires gradual underflow. If the process enables
+`torch.set_flush_denormal(True)`, its forward and backward fail closed instead of
+silently flushing subnormal probabilities or gradients to zero.
+
+The CUDA bit reference is included only when the build preserves exact FP32 math.
+`KERNEL_ALIGN_USE_FAST_MATH=1`, or external NVCC flags such as `--use_fast_math`,
+`--ftz=true`, `--prec-div=false`, and `--prec-sqrt=false`, omit its source and binding.
+The build checks `NVCC_PREPEND_FLAGS`, `NVCC_APPEND_FLAGS`, and `TORCH_NVCC_FLAGS`;
+unparseable values and options files whose contents cannot be verified are treated as
+unsafe. Other kernels remain available, and registry dispatch falls back to Triton or
+the PyTorch reference.
+
 The shared fingerprint is `joint-attn-softmax-v2-logical-mask-tile256-exp7`. It identifies
 the arithmetic contract, not a compiled binary hash.
 
@@ -189,16 +201,19 @@ python tools/validation/operators/check_operator.py --op joint_attn_softmax --ca
   --device cuda --dtype bf16 --batch 2 --seq 257 --check-grad
 ```
 
-The validation environment was WSL Ubuntu, Python 3.12.13, PyTorch
+The performance measurements above used WSL Ubuntu, Python 3.12.13, PyTorch
 2.13.0+cu130, Triton 3.7.1, NVIDIA driver 591.86, CUDA toolkit/runtime 13.0,
 GCC 13.3.0, and an NVIDIA GeForce RTX 5060 (compute capability 12.0).
 
-On 2026-10-12, the seven-file suite passed **173 tests, with 0 skipped, 0
-failures, and 0 errors**. All three `check_operator.py` runs passed with
+On 2026-10-29, the seven-file suite was rerun from the current worktree on the
+same software and GPU with NVIDIA driver 610.88. It passed **188 tests, with 0
+skipped, 0 failures, and 0 errors**. All three `check_operator.py` runs passed with
 gradient checks. Registry dispatch selected the CUDA extension with fingerprint
 `joint-attn-softmax-v2-logical-mask-tile256-exp7` and no fallback. Separate BF16/FP32
 forward/backward benchmark runs passed strict CUDA↔Triton byte checks at all
-three key lengths. These results qualify that environment only.
+three key lengths. A short masked benchmark smoke test was also rerun in forward
+and backward, with every CUDA↔Triton comparison byte-equal. These results qualify
+that environment only.
 
 ## Known Limitations
 

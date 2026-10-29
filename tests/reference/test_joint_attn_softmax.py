@@ -58,6 +58,37 @@ def test_forward_fp32_uniform_row_returns_uniform_probabilities():
     assert tensor_bytes_equal(probabilities, expected)
 
 
+def test_cpu_reference_rejects_flush_denormal_mode():
+    scores = torch.tensor([[0.0, -90.0, -100.0]], dtype=torch.float32)
+    minimum_normal = torch.tensor([torch.finfo(torch.float32).tiny], dtype=torch.float32)
+    flush_denormal_was_enabled = (minimum_normal * 0.5).item() == 0.0
+
+    try:
+        if not torch.set_flush_denormal(True):
+            pytest.skip("torch.set_flush_denormal is unsupported on this CPU")
+        with pytest.raises(RuntimeError, match=r"torch\.set_flush_denormal\(False\)"):
+            NativeJointAttnSoftmaxOp().forward_fp32(scores)
+    finally:
+        torch.set_flush_denormal(flush_denormal_was_enabled)
+
+
+def test_cpu_reference_backward_rejects_flush_denormal_mode():
+    minimum_normal = torch.tensor([torch.finfo(torch.float32).tiny], dtype=torch.float32)
+    flush_denormal_was_enabled = (minimum_normal * 0.5).item() == 0.0
+
+    try:
+        if not torch.set_flush_denormal(False):
+            pytest.skip("torch.set_flush_denormal is unsupported on this CPU")
+        scores = torch.tensor([[0.0, -90.0, -100.0]], dtype=torch.float32, requires_grad=True)
+        probabilities = NativeJointAttnSoftmaxOp().forward_fp32(scores)
+
+        torch.set_flush_denormal(True)
+        with pytest.raises(RuntimeError, match=r"torch\.set_flush_denormal\(False\)"):
+            probabilities.backward(torch.ones_like(probabilities))
+    finally:
+        torch.set_flush_denormal(flush_denormal_was_enabled)
+
+
 def test_forward_fp32_is_stable_for_large_scores():
     scores = torch.tensor([[1000.0, 1001.0, 1002.0]], dtype=torch.float32)
 

@@ -71,10 +71,11 @@ def _apply_fixed_softmax(
     key_padding_mask: torch.Tensor | None,
 ) -> torch.Tensor:
     """Apply optional layout handling around the fixed softmax core."""
+    _validate_scores(scores)
+    _require_gradual_underflow(scores)
     if key_padding_mask is None:
         return _NativeJointAttnSoftmaxFunction.apply(scores, output_fp32)
 
-    _validate_scores(scores)
     mask_layout = KeyMaskLayout.from_mask(scores, key_padding_mask)
     logical_scores = mask_layout.compact(scores, fill_value=float("-inf"))
     logical_probabilities = _NativeJointAttnSoftmaxFunction.apply(
@@ -87,7 +88,6 @@ def _apply_fixed_softmax(
 class _NativeJointAttnSoftmaxFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, scores: torch.Tensor, output_fp32: bool) -> torch.Tensor:
-        _validate_scores(scores)
         probabilities_fp32 = _fixed_online_softmax(scores)
         ctx.save_for_backward(probabilities_fp32)
         ctx.input_dtype = scores.dtype
@@ -97,6 +97,7 @@ class _NativeJointAttnSoftmaxFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_probabilities: torch.Tensor) -> tuple[torch.Tensor, None]:
         (probabilities_fp32,) = ctx.saved_tensors
+        _require_gradual_underflow(probabilities_fp32)
         grad_scores = _fixed_softmax_backward(probabilities_fp32, grad_probabilities)
         return grad_scores.to(ctx.input_dtype), None
 
@@ -109,6 +110,21 @@ def _validate_scores(scores: torch.Tensor) -> None:
         raise ValueError("scores must be at least 1-D with shape [..., K]")
     if scores.size(-1) == 0:
         raise ValueError("scores key dimension must be non-empty")
+
+
+def _require_gradual_underflow(values: torch.Tensor) -> None:
+    """Reject CPU execution when the process flushes FP32 subnormals to zero."""
+    if values.device.type == "cpu" and _cpu_flushes_denormals():
+        raise RuntimeError(
+            "joint-attention softmax CPU reference requires gradual underflow; "
+            "call torch.set_flush_denormal(False) before execution"
+        )
+
+
+def _cpu_flushes_denormals() -> bool:
+    """Return whether FP32 subnormal arithmetic is currently flushed to zero."""
+    minimum_normal = torch.tensor([torch.finfo(torch.float32).tiny], dtype=torch.float32)
+    return (minimum_normal * 0.5).item() == 0.0
 
 
 # ---------------------------------------------------------------------------
