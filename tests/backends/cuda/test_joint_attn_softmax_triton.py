@@ -409,7 +409,7 @@ def test_masked_benchmark_reports_prompt_layout():
             backward=False,
             warmup=0,
             iterations=1,
-            backends=["cuda", "triton"],
+            backends=["cuda", "triton", "pytorch"],
             cases={"synthetic": 513},
             valid_text_keys=73,
         )
@@ -420,6 +420,11 @@ def test_masked_benchmark_reports_prompt_layout():
     assert report["configuration"]["warmup"] == 0
     assert report["configuration"]["iterations"] == 1
     assert report["environment"]["git_commit"] != "unavailable"
+    assert {record["backend"] for record in report["results"]} == {
+        "cuda",
+        "triton",
+        "pytorch",
+    }
     assert all(record["masked_prompt_keys"] == 439 for record in report["results"])
     assert all(record["byte_equal_to_cuda"] for record in report["results"])
 
