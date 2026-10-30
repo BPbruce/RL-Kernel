@@ -23,6 +23,8 @@ __device__ __forceinline__ float portable_exp_nonpositive(float value) {
   if (isnan(value)) {
     return value;
   }
+  // -104 is below the FP32 exp round-to-zero boundary, ln(2^-150) ~= -103.972.
+  // Return before range reduction so -inf is never converted to an integer.
   if (value < -104.0f) {
     return 0.0f;
   }

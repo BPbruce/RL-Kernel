@@ -90,7 +90,7 @@ def _load_backends(names: list[str]) -> dict[str, object]:
     if unknown:
         raise ValueError(f"unknown backends: {unknown}")
     if "triton" in names:
-        from rl_engine.backends.shared.triton.attention.joint_attn_softmax import (
+        from rl_engine.backends.cuda.attention.joint_attn_softmax_triton import (
             TritonJointAttnSoftmaxOp,
         )
 

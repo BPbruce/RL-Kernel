@@ -84,7 +84,7 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
         "rl_engine.backends.cuda.attention.joint_attn_softmax.JointAttnSoftmaxCudaOp"
     )
     TRITON_JOINT_ATTN_SOFTMAX = (
-        "rl_engine.backends.shared.triton.attention.joint_attn_softmax." "TritonJointAttnSoftmaxOp"
+        "rl_engine.backends.cuda.attention.joint_attn_softmax_triton.TritonJointAttnSoftmaxOp"
     )
 
     # AMD ROCm optimized stack

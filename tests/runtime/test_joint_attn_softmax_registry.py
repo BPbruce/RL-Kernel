@@ -3,12 +3,37 @@
 
 """Dispatch trace and fallback coverage for joint-attention softmax."""
 
+import importlib
+
 import pytest
 import torch
 
 from rl_engine.reference.attention.joint_attn_softmax import NativeJointAttnSoftmaxOp
 from rl_engine.runtime.registry import KernelRegistry, OpBackend
 from rl_engine.validation.common.bitwise import tensor_bytes_equal
+
+
+def test_legacy_package_exports_the_cuda_triton_operator() -> None:
+    pytest.importorskip("triton")
+    from rl_engine.backends.cuda.attention.joint_attn_softmax_triton import (
+        TritonJointAttnSoftmaxOp as CanonicalOp,
+    )
+    from rl_engine.kernels.ops.triton.attention import (
+        TritonJointAttnSoftmaxOp as LegacyOp,
+    )
+
+    assert LegacyOp is CanonicalOp
+
+
+def test_legacy_module_shares_the_canonical_cuda_triton_module() -> None:
+    pytest.importorskip("triton")
+    legacy = importlib.import_module("rl_engine.kernels.ops.triton.attention.joint_attn_softmax")
+    canonical = importlib.import_module(
+        "rl_engine.backends.cuda.attention.joint_attn_softmax_triton"
+    )
+
+    assert legacy is canonical
+    assert legacy.TritonJointAttnSoftmaxOp is canonical.TritonJointAttnSoftmaxOp
 
 
 @pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA CUDA dispatch only")
@@ -62,7 +87,7 @@ def test_cuda_and_triton_unavailable_falls_back_to_pytorch(monkeypatch) -> None:
 )
 def test_cuda_unavailable_selects_triton_with_trace(monkeypatch) -> None:
     pytest.importorskip("triton")
-    from rl_engine.backends.shared.triton.attention.joint_attn_softmax import (
+    from rl_engine.backends.cuda.attention.joint_attn_softmax_triton import (
         TritonJointAttnSoftmaxOp,
     )
 

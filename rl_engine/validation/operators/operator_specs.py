@@ -95,7 +95,7 @@ OP_SPECS = {
                 "rl_engine.reference.attention.joint_attn_softmax.NativeJointAttnSoftmaxOp"
             ),
             "triton": (
-                "rl_engine.backends.shared.triton.attention.joint_attn_softmax."
+                "rl_engine.backends.cuda.attention.joint_attn_softmax_triton."
                 "TritonJointAttnSoftmaxOp"
             ),
             "cuda": ("rl_engine.backends.cuda.attention.joint_attn_softmax.JointAttnSoftmaxCudaOp"),

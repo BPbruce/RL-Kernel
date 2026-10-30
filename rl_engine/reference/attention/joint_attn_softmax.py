@@ -307,12 +307,14 @@ def _portable_exp_nonpositive(values: torch.Tensor) -> torch.Tensor:
     avoid depending on platform ``exp`` implementations. The operation order
     below is part of the cross-backend byte-equality contract.
     """
-    # Clamp underflow and keep NaNs out of the integer conversion.
+    # -104 is below the FP32 exp round-to-zero boundary, ln(2**-150) ~= -103.972.
+    # Clamp -inf and keep NaNs out of the later integer exponent conversion.
     safe_values = torch.where(
         torch.isnan(values), torch.zeros_like(values), torch.clamp_min(values, -104.0)
     )
     # Write x as exponent * ln(2) + remainder.
-    exponent = torch.floor(safe_values * 1.4426950408889634 + 0.5).to(torch.int32)
+    # FP32 log2(e), bits 0x3FB8AA3B, shared by all backends.
+    exponent = torch.floor(safe_values * 1.4426950216293335 + 0.5).to(torch.int32)
     exponent_fp32 = exponent.to(torch.float32)
     remainder = safe_values - exponent_fp32 * 0.693145751953125
     remainder = remainder - exponent_fp32 * 1.428606765330187e-6

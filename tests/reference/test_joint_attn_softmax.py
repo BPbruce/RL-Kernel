@@ -3,6 +3,8 @@
 
 """Tests for the joint-attention softmax operator (issue #386)."""
 
+import math
+
 import pytest
 import torch
 
@@ -56,6 +58,39 @@ def test_forward_fp32_uniform_row_returns_uniform_probabilities():
     assert probabilities.dtype == torch.float32
     assert probabilities.shape == scores.shape
     assert tensor_bytes_equal(probabilities, expected)
+
+
+def test_fp32_exp_underflow_boundary_returns_expected_bits():
+    round_to_zero_boundary = math.log(math.ldexp(1.0, -150))
+    boundary_above = torch.tensor(round_to_zero_boundary, dtype=torch.float32)
+    boundary_below = torch.nextafter(
+        boundary_above, torch.tensor(float("-inf"), dtype=torch.float32)
+    )
+    assert boundary_below.item() < round_to_zero_boundary < boundary_above.item()
+
+    scores = torch.tensor(
+        [
+            [
+                0.0,
+                float("-inf"),
+                -104.0,
+                -103.9,
+                boundary_below.item(),
+                boundary_above.item(),
+            ]
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    upstream = torch.arange(scores.numel(), dtype=torch.float32).reshape_as(scores)
+
+    probabilities = NativeJointAttnSoftmaxOp().forward_fp32(scores)
+    probabilities.backward(upstream)
+
+    expected_probability_bits = torch.tensor([[0x3F800000, 0, 0, 1, 0, 1]], dtype=torch.int32)
+    expected_gradient_bits = torch.tensor([[-2147483640, 0, 0, 3, 0, 5]], dtype=torch.int32)
+    assert tensor_bytes_equal(probabilities.view(torch.int32), expected_probability_bits)
+    assert tensor_bytes_equal(scores.grad.view(torch.int32), expected_gradient_bits)
 
 
 def test_cpu_reference_rejects_flush_denormal_mode():

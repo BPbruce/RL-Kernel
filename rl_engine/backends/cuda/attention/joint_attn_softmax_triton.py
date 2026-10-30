@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Triton joint-attention softmax with the issue #386 arithmetic contract."""
+"""CUDA Triton joint-attention softmax with the issue #386 arithmetic contract."""
 
 from __future__ import annotations
 
@@ -80,6 +80,8 @@ def _is_nan(values):
 @triton.jit
 def _portable_exp_nonpositive(values):
     is_nan = _is_nan(values)
+    # -104 is below the FP32 exp round-to-zero boundary, ln(2**-150) ~= -103.972.
+    # Clamp -inf and keep NaNs out of the later integer exponent conversion.
     safe_values = tl.where(is_nan, 0.0, tl.maximum(values, -104.0))
     scaled = _add_rn(_mul_rn(safe_values, 1.4426950216293335), 0.5)
     exponent = tl.floor(scaled).to(tl.int32)
@@ -590,7 +592,7 @@ class _TritonJointAttnSoftmaxFunction(torch.autograd.Function):
 
 
 class TritonJointAttnSoftmaxOp:
-    """Triton softmax using the shared fixed-order FP32 contract."""
+    """CUDA Triton softmax using the fixed-order FP32 contract."""
 
     backend_id = "rlkernel.triton.joint_attn_softmax"
     provenance = {

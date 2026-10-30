@@ -12,10 +12,10 @@ if __name__ == "__main__":
     import runpy
 
     runpy.run_module(
-        "rl_engine.backends.shared.triton.attention.joint_attn_softmax",
+        "rl_engine.backends.cuda.attention.joint_attn_softmax_triton",
         run_name="__main__",
     )
 else:
     sys.modules[__name__] = importlib.import_module(
-        "rl_engine.backends.shared.triton.attention.joint_attn_softmax"
+        "rl_engine.backends.cuda.attention.joint_attn_softmax_triton"
     )
