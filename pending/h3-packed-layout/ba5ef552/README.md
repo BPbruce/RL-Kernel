@@ -6,37 +6,29 @@ Tests for [PR #666](https://github.com/RL-Align/RL-Kernel/pull/666) at [`ba5ef55
 
 | Check | Result |
 | --- | --- |
-| H3 CPU selection and layout compatibility | 233 passed, 10 skipped |
-| Windows named-dimension cases | 9 passed |
+| H3 CPU selection and layout compatibility | 243 passed, 0 skipped. [pytest report](pytest-cpu.xml) |
 | Block 0 manual vs schema-based permutation | Block inputs and outputs were byte-identical. [Replay JSON](block-probe-rtx5060.json) |
 | Block 0 H-C3 with SDPA math | 84 of 264 output rows differed after restoring row order. Max absolute difference was 2.0. The first difference was in attention. [Per-node JSON](node-trace.json) |
 | Manual permutation on `test-h3@07533aee` | Same 84 rows and max absolute difference of 2.0. [Baseline JSON](baseline-07533aee.json) |
 | Full-model H-C3 | Not run |
 
-The WSL skips were nine named-dimension cases and one optional Diffusers comparison.
-
 ## Environment
 
-- **CPU.** Ubuntu 24.04 on WSL 2 (x86-64), Python 3.10.20, PyTorch `2.14.1+cpu`. The separate named-dimension run used Windows 11, Python 3.14.3 and PyTorch `2.11.0+cpu`.
+- **CPU.** Ubuntu 24.04 on WSL 2 (x86-64), Python `3.12.13`, PyTorch `2.11.0+cu130` with CUDA disabled, Diffusers `0.41.0`, and pytest `9.1.1`.
 - **Block 0.** Ubuntu 24.04 on WSL 2 (x86-64), one RTX 5060 (SM 12.0), driver 610.88, Python 3.12.13, PyTorch `2.13.0+cu130` and CUDA 13.0. The repository's provider path used PyTorch SDPA math. Hidden states were BF16, and SDPA math used FP32 accumulation with reduced-precision math reductions disabled.
 - **Inputs.** Block 0 and conditioning weights from `MiniMax-H3@42ed227ee7df40d41602854ae760620d6eb651fe`, plus seeded synthetic hidden states. The FL2VA replay used batch size 1 and 264 rows. The input and permutation seeds were 0 and 7. Both condition row counts came from the fixture and were 0 for this case.
 
 ## CPU commands
 
-Run from a checkout of `ba5ef5520d3f032b055ec9073673d58e6adf4c4b` with the project's test dependencies installed.
+Run from a checkout of `ba5ef5520d3f032b055ec9073673d58e6adf4c4b` with the project's test dependencies and the versions listed above.
 
 ```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -B -m pytest -q -ra -p no:cacheprovider \
+CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -B -m pytest -q -ra -p no:cacheprovider \
+  --junitxml=pytest-cpu.xml \
   tests/reference/minimax_h3 \
   tests/runtime/test_h3_sigma_schedule_dispatch.py \
   tests/models/minimax_h3/test_h3_packed_layout.py \
   tests/runtime/test_layout_compatibility.py
-```
-
-On Windows with the named-dimension-capable PyTorch build:
-
-```powershell
-python -B -m pytest -q -ra -p no:cacheprovider tests/models/minimax_h3/test_h3_packed_layout.py -k named
 ```
 
 ## Block 0 commands
