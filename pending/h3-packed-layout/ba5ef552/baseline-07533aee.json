@@ -1,0 +1,11 @@
+{
+  "rl_kernel_revision": "07533aee8c981473c00d69a847d86f9a2539b0ed",
+  "attention": {
+    "different_rows": 144,
+    "max_abs": 0.03125
+  },
+  "block_output": {
+    "different_rows": 84,
+    "max_abs": 2.0
+  }
+}
